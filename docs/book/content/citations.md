@@ -1,5 +1,4 @@
 # Citations and use cases of OG-Core
 
-```{bibliography} ../citations.bib
-:all :
+```{include} ../_generated/citations.md
 ```

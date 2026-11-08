@@ -1,7 +1,22 @@
 (Chap_Intro)=
 # OG-Core
 
-`OG-Core` is the core logic for a country-agnostic overlapping-generations (OG) model of an economy that allows for dynamic general equilibrium analysis of fiscal policy. The model output focuses changes in macroeconomic aggregates (GDP, investment, consumption), wages, interest rates, and the stream of tax revenues over time. Although `OG-Core` can be run independently based on default parameter values (currently representing something similar to the United States), it is meant to be a dependency of a country-specific calibration. This documentation contains the following major sections, which are regularly updated.
+| | |
+| --- | --- |
+| Org | [PSL catalog](https://www.PSLmodels.org) · [CC0 license](https://github.com/PSLmodels/OG-Core/blob/master/LICENSE) · [Documentation](https://pslmodels.github.io/OG-Core/) |
+| Package | Python 3.12–3.15 · [PyPI releases and downloads](https://pypi.org/project/ogcore/) · [Ruff](https://github.com/astral-sh/ruff) |
+| Testing | [Tests](https://github.com/PSLmodels/OG-Core/actions/workflows/build_and_test.yml) · [Documentation builds](https://github.com/PSLmodels/OG-Core/actions/workflows/deploy_docs.yml) · [Formatting](https://github.com/PSLmodels/OG-Core/actions/workflows/check_ruff.yml) · [Coverage](https://codecov.io/gh/PSLmodels/OG-Core) |
+
+`OG-Core` is the core logic for a country-agnostic overlapping-generations (OG) model of an economy that allows for dynamic general equilibrium analysis of fiscal policy. The source code is openly available for download or collaboration at the GitHub repository [www.github.com/PSLmodels/OG-Core](https://github.com/PSLmodels/OG-Core), or you can click on the GitHub icon at the top right of this page.
+
+**Country calibrations of OG-Core**
+|               |             |             |
+| :-----------: | :---------: | :---------: |
+| United States, [OG-USA](https://github.com/PSLmodels/OG-USA) | United Kingdom, [OG-UK](https://github.com/PSLmodels/OG-USA) | Phillipines, [OG-PHL](https://github.com/EAPD-DRB/OG-PHL) |
+|  South Africa, [OG-ZAF](https://github.com/EAPD-DRB/OG-ZAF) | Indonesia, [OG-IDN](https://github.com/EAPD-DRB/OG-IDN) | Ethiopia, [OG-ETH](https://github.com/EAPD-DRB/OG-ETH) |
+| India, [OG-IND](https://github.com/OpenSourceEcon/OG-IND) | Malaysia, [OG-MYS](https://github.com/OpenSourceEcon/OG-MYS) |  |
+
+The model output focuses changes in macroeconomic aggregates (GDP, investment, consumption), wages, interest rates, and the stream of tax revenues over time. Although `OG-Core` can be run independently based on default parameter values (currently representing something similar to the United States), it is meant to be a dependency of a country-specific calibration. This documentation contains the following major sections, which are regularly updated.
 
 * Contributing to `OG-Core`
 * `OG-Core` API
@@ -20,10 +35,10 @@
 (Sec_Disclaimer)=
 ## Disclaimer
 
-The model is continuously under development. Users will be notified through [closed PR threads](https://github.com/PSLmodels/OG-Core/pulls?q=is%3Apr+is%3Aclosed) and through the [release notes](https://github.com/PSLmodels/OG-Core/releases) what changes have been implemented. The package will have released versions, which will be checked against existing code prior to release. Stay tuned for an upcoming release!
+The OG-Core model is continuously under development. Users will be notified through [closed PR threads](https://github.com/PSLmodels/OG-Core/pulls?q=is%3Apr+is%3Aclosed) and through the [release notes](https://github.com/PSLmodels/OG-Core/releases) what changes have been implemented. The package will have released versions, which will be checked against existing code prior to release. Stay tuned for an upcoming release!
 
 
-(Sec_CitingOGUSA)=
+(Sec_CitingOGCore)=
 ## Citing OG-Core
 
-`OG-Core` (Version #.#.#)[Source code], https://github.com/PSLmodels/OG-Core
+`OG-Core` (Version #.#.#)[Source code], https://github.com/PSLmodels/OG-Core.

@@ -1,0 +1,1469 @@
+"""
+This module contains tests of the TPI.py module of the OG-Core model. This
+module contains the following tests:
+    - test_get_initial_SS_values(), 3 parameterizations
+    - test_firstdoughnutring(), 1 parameterization
+    - test_twist_doughnut(), 2 parameterizations
+    - test_params_to_array(), 7 parameterizations
+    - test_inner_loop(), 1 parameterization
+    - test_run_TPI_full_run(), 11 parameterizations, local only
+    - test_run_TPI(), 2 parameterizations, local only
+    - test_run_TPI_extra(), 9 parameterizations, local only
+    - test_run_TPI_serial_no_client(), 1 parameterization
+"""
+
+import multiprocessing
+from distributed import Client, LocalCluster
+import pytest
+import pickle
+import numpy as np
+import os
+import sys
+import json
+from ogcore import SS, TPI, utils, solvers
+from ogcore.parameters import Specifications
+
+NUM_WORKERS = min(multiprocessing.cpu_count(), 4)
+CUR_PATH = os.path.abspath(os.path.dirname(__file__))
+
+SS_VAR_NAME_MAPPING = {
+    "Yss": "Y",
+    "Bss": "B",
+    "Kss": "K",
+    "K_f_ss": "K_f",
+    "K_d_ss": "K_d",
+    "Lss": "L",
+    "Css": "C",
+    "Iss": "I",
+    "Iss_total": "I_total",
+    "I_d_ss": "I_d",
+    "K_g_ss": "K_g",
+    "I_g_ss": "I_g",
+    "BQss": "BQ",
+    "RMss": "RM",
+    "Y_vec_ss": "Y_m",
+    "K_vec_ss": "K_m",
+    "L_vec_ss": "L_m",
+    "C_vec_ss": "C_i",
+    "TR_ss": "TR",
+    "agg_pension_outlays": "agg_pension_outlays",
+    "Gss": "G",
+    "UBI_outlays_SS": "UBI",
+    "total_tax_revenue": "total_tax_revenue",
+    "business_tax_revenue": "business_tax_revenue",
+    "iit_payroll_tax_revenue": "iit_payroll_tax_revenue",
+    "iit_revenue": "iit_revenue",
+    "payroll_tax_revenue": "payroll_tax_revenue",
+    "bequest_tax_revenue": "bequest_tax_revenue",
+    "wealth_tax_revenue": "wealth_tax_revenue",
+    "cons_tax_revenue": "cons_tax_revenue",
+    "Dss": "D",
+    "D_f_ss": "D_f",
+    "D_d_ss": "D_d",
+    "new_borrowing": "new_borrowing",
+    "debt_service": "debt_service",
+    "new_borrowing_f": "new_borrowing_f",
+    "debt_service_f": "debt_service_f",
+    "rss": "r",
+    "r_gov_ss": "r_gov",
+    "r_p_ss": "r_p",
+    "wss": "w",
+    "p_m_ss": "p_m",
+    "p_i_ss": "p_i",
+    "p_tilde_ss": "p_tilde",
+    "bssmat_splus1": "b_sp1",
+    "bssmat_s": "b_s",
+    "nssmat": "n",
+    "cssmat": "c",
+    "c_i_ss_mat": "c_i",
+    "bqssmat": "bq",
+    "rmssmat": "rm",
+    "trssmat": "tr",
+    "ubissmat": "ubi",
+    "yss_before_tax_mat": "before_tax_income",
+    "total_taxes_ss": "hh_net_taxes",
+    "etr_ss": "etr",
+    "mtrx_ss": "mtrx",
+    "mtry_ss": "mtry",
+    "theta": "theta",
+    "factor_ss": "factor",
+    "euler_savings": "euler_savings",
+    "euler_labor_leisure": "euler_labor_leisure",
+    "resource_constraint_error": "resource_constraint_error",
+}
+
+VAR_NAME_MAPPING = {
+    "Y": "Y",
+    "B": "B",
+    "K": "K",
+    "K_f": "K_f",
+    "K_d": "K_d",
+    "L": "L",
+    "C": "C",
+    "I": "I",
+    "I_total": "I_total",
+    "I_d": "I_d",
+    "K_g": "K_g",
+    "I_g": "I_g",
+    "BQ": "BQ",
+    "RM": "RM",
+    "Y_vec": "Y_m",
+    "K_vec": "K_m",
+    "L_vec": "L_m",
+    "C_vec": "C_i",
+    "TR": "TR",
+    "agg_pension_outlays": "agg_pension_outlays",
+    "G": "G",
+    "UBI_path": "UBI",
+    "total_tax_revenue": "total_tax_revenue",
+    "business_tax_revenue": "business_tax_revenue",
+    "iit_payroll_tax_revenue": "iit_payroll_tax_revenue",
+    "iit_revenue": "iit_revenue",
+    "payroll_tax_revenue": "payroll_tax_revenue",
+    "bequest_tax_revenue": "bequest_tax_revenue",
+    "wealth_tax_revenue": "wealth_tax_revenue",
+    "cons_tax_revenue": "cons_tax_revenue",
+    "D": "D",
+    "D_f": "D_f",
+    "D_d": "D_d",
+    "new_borrowing": "new_borrowing",
+    "debt_service": "debt_service",
+    "new_borrowing_f": "new_borrowing_f",
+    "debt_service_f": "debt_service_f",
+    "r": "r",
+    "r_gov": "r_gov",
+    "r_p": "r_p",
+    "w": "w",
+    "p_m": "p_m",
+    "p_i": "p_i",
+    "p_tilde": "p_tilde",
+    "bmat_splus1": "b_sp1",
+    "bmat_s": "b_s",
+    "n_mat": "n",
+    "c_path": "c",
+    "c_i_path": "c_i",
+    "bq_path": "bq",
+    "rm_path": "rm",
+    "tr_path": "tr",
+    "ubi_path": "ubi",
+    "y_before_tax_mat": "before_tax_income",
+    "tax_path": "hh_net_taxes",
+    "etr_path": "etr",
+    "mtrx_path": "mtrx",
+    "mtry_path": "mtry",
+    "theta": "theta",
+    "factor": "factor",
+    "euler_savings": "euler_savings",
+    "euler_laborleisure": "euler_labor_leisure",
+    "eul_savings": "euler_savings",
+    "eul_laborleisure": "euler_labor_leisure",
+    "resource_constraint_error": "resource_constraint_error",
+}
+
+TEST_PARAM_DICT = json.load(
+    open(os.path.join(CUR_PATH, "testing_params.json"))
+)
+
+
+@pytest.fixture(scope="module")
+def dask_client():
+    cluster = LocalCluster(
+        n_workers=NUM_WORKERS,
+        threads_per_worker=2,
+        memory_limit="3GB",
+        timeout="900s",
+        heartbeat_interval="30s",
+        death_timeout="120s",
+    )
+    client = Client(cluster)
+    yield client
+    # teardown
+    # client.close()
+    # cluster.close()
+
+
+filename1 = "intial_SS_values_baseline.pkl"
+filename2 = "intial_SS_values_reform.pkl"
+filename3 = "intial_SS_values_reform_base_spend.pkl"
+
+
+@pytest.mark.parametrize(
+    "baseline,param_updates,filename",
+    [
+        (True, {}, filename1),
+        (False, {}, filename2),
+        (False, {"baseline_spending": True}, filename3),
+    ],
+    ids=["Baseline", "Reform", "Reform, baseline_spending"],
+)
+def test_get_initial_SS_values(baseline, param_updates, filename, tmpdir):
+    p = Specifications(baseline=baseline, num_workers=NUM_WORKERS)
+    p.update_specifications(param_updates)
+
+    old_baseline_dir = os.path.join(CUR_PATH, "test_io_data", "OUTPUT")
+    ss_vars = utils.safe_read_pickle(
+        os.path.join(old_baseline_dir, "SS", "SS_vars.pkl")
+    )
+    ss_vars_new = {}
+    for k, v in ss_vars.items():
+        ss_vars_new[SS_VAR_NAME_MAPPING.get(k, k)] = v
+    tpi_vars = utils.safe_read_pickle(
+        os.path.join(old_baseline_dir, "TPI", "TPI_vars.pkl")
+    )
+    tpi_vars_new = {}
+    for k, v in tpi_vars.items():
+        tpi_vars_new[VAR_NAME_MAPPING.get(k, k)] = v
+    baseline_dir = os.path.join(tmpdir, "baseline")
+    ss_dir = os.path.join(baseline_dir, "SS")
+    utils.mkdirs(ss_dir)
+    tpi_dir = os.path.join(baseline_dir, "TPI")
+    utils.mkdirs(tpi_dir)
+    ss_path = os.path.join(baseline_dir, "SS", "SS_vars.pkl")
+    with open(ss_path, "wb") as f:
+        pickle.dump(ss_vars_new, f)
+    tpi_path = os.path.join(baseline_dir, "TPI", "TPI_vars.pkl")
+    with open(tpi_path, "wb") as f:
+        pickle.dump(tpi_vars_new, f)
+
+    p.baseline_dir = baseline_dir
+    p.output_base = baseline_dir
+    test_tuple = TPI.get_initial_SS_values(p)
+    (
+        test_initial_values,
+        test_ss_vars,
+        test_theta,
+        test_baseline_values,
+    ) = test_tuple
+    expected_tuple = utils.safe_read_pickle(
+        os.path.join(CUR_PATH, "test_io_data", filename)
+    )
+    (
+        exp_initial_values,
+        exp_ss_vars,
+        exp_theta,
+        exp_baseline_values,
+    ) = expected_tuple
+
+    assert len(test_initial_values) == len(exp_initial_values)
+    for k, v in enumerate(exp_initial_values):
+        assert np.allclose(test_initial_values[k], v, equal_nan=True)
+
+    if p.baseline_spending:
+        # The expected values were saved before foreign aid was added to
+        # baseline_values (after Ig_baseline). The saved baseline output
+        # has no foreign aid, so it is reconstructed as alpha_FA * Y.
+        exp_baseline_values = list(exp_baseline_values)
+        exp_baseline_values.insert(
+            4, p.alpha_FA[: p.T] * tpi_vars_new["Y"][: p.T]
+        )
+        assert len(test_baseline_values) == len(exp_baseline_values)
+        for k, v in enumerate(exp_baseline_values):
+            assert np.allclose(test_baseline_values[k], v, equal_nan=True)
+
+    assert np.allclose(test_theta, exp_theta)
+
+    for k, v in exp_ss_vars.items():
+        assert np.allclose(
+            test_ss_vars[SS_VAR_NAME_MAPPING.get(k, k)], v, equal_nan=True
+        )
+
+
+def test_rc_error_message():
+    """The resource-constraint failure message names the largest violation,
+    the period it occurs in, and the tolerance."""
+    T, M = 320, 2
+    RC_error = np.full((T, M), 1e-8)
+    RC_error[T - 1, 1] = -0.05  # a terminal-boundary spike (signed)
+    msg = TPI._rc_error_message(RC_error, 1e-4)
+    assert "5.00e-02" in msg  # the max absolute error, reported
+    assert f"period {T - 1}" in msg  # the period it occurs in
+    assert "1e-04" in msg or "0.0001" in msg  # the tolerance
+
+
+def test_firstdoughnutring():
+    # Test TPI.firstdoughnutring function.  Provide inputs to function and
+    # ensure that output returned matches what it has been before.
+    input_tuple = utils.safe_read_pickle(
+        os.path.join(CUR_PATH, "test_io_data", "firstdoughnutring_inputs.pkl")
+    )
+    guesses, r, w, bq, rm, tr, theta, factor, ubi, j, initial_b = input_tuple
+    p_tilde = 1.0  # needed for multi-industry version
+    p_i = 1.0  # needed for multi-industry version
+    p = Specifications()
+    test_list = TPI.firstdoughnutring(
+        guesses,
+        r,
+        w,
+        p_tilde,
+        p_i,
+        bq,
+        rm,
+        tr,
+        theta,
+        factor,
+        ubi,
+        j,
+        initial_b,
+        p,
+    )
+
+    expected_list = utils.safe_read_pickle(
+        os.path.join(CUR_PATH, "test_io_data", "firstdoughnutring_outputs.pkl")
+    )
+
+    assert np.allclose(np.array(test_list), np.array(expected_list))
+
+
+def test_tpi_outer_method_default_is_picard():
+    # The pluggable outer method defaults to picard -> no accelerator, so the
+    # solve path (and golden outputs) is unchanged.
+    p = Specifications()
+    assert p.TPI_outer_method == "picard"
+    assert solvers.make_outer_updater(p.TPI_outer_method, p) is None
+
+
+def test_make_outer_updater():
+    # picard -> None (native damped path); anderson -> an AndersonAccelerator
+    # configured from the p.TPI_anderson_* params; unknown -> ValueError.
+    p = Specifications()
+    assert solvers.make_outer_updater("picard", p) is None
+    u = solvers.make_outer_updater("anderson", p)
+    assert isinstance(u, solvers.AndersonAccelerator)
+    assert u.m == p.TPI_anderson_m
+    assert u.beta == p.TPI_anderson_beta
+    with pytest.raises(ValueError):
+        solvers.make_outer_updater("not-a-method", p)
+
+
+def test_anderson_accelerator_beats_picard():
+    # On a linear contraction fixed point, Anderson must converge and in far
+    # fewer iterations than plain damped Picard (guards the accelerator math).
+    out = solvers._selftest()
+    assert out["anderson_iters"] < out["picard_iters"]
+    assert out["anderson_iters"] < 20
+
+
+def test_anderson_scaling_and_reset():
+    # The per-element scale makes the first step a damped-Picard step, and
+    # reset() clears the residual history.
+    u = solvers.AndersonAccelerator(m=3, beta=1.0)
+    x = np.array([0.05, 1000.0, -2.0])
+    gx = np.array([0.06, 1010.0, -1.5])
+    x1 = u.update(x, gx)
+    # beta=1 first step returns gx exactly (x + 1*(gx - x)).
+    assert np.allclose(x1, gx)
+    assert len(u._F) == 1
+    u.reset()
+    assert u._F == [] and u._X == []
+
+
+def test_stall_defaults_are_warn_only():
+    # Stall detection defaults: a 50-iteration window and warn-only
+    # action, so model solutions are unchanged.
+    p = Specifications()
+    assert p.TPI_stall_window == 50
+    assert p.TPI_stall_action == "warn"
+
+
+def test_diagnose_stall_progressing_and_disabled():
+    # A steadily improving distance history is never a stall, and a
+    # non-positive window (or too-short history) disables the check.
+    improving = 10.0 * 0.9 ** np.arange(100)
+    assert solvers.diagnose_stall(improving, 100, 20, 0.05) is None
+    stuck = np.full(100, 5.0)
+    assert solvers.diagnose_stall(stuck, 100, 0, 0.05) is None
+    assert solvers.diagnose_stall(stuck, 30, 20, 0.05) is None
+
+
+def test_diagnose_stall_oscillating():
+    # A distance that bounces in a band without improving on the earlier
+    # best is diagnosed as the outer loop cycling.
+    rng = np.arange(100)
+    bouncing = 0.3 + 0.25 * (-1.0) ** rng
+    assert solvers.diagnose_stall(bouncing, 100, 20, 0.05) == "oscillating"
+
+
+def test_diagnose_stall_diverging():
+    # A recent best far above the earlier best is diagnosed as a
+    # diverging economy rather than a cycling solver -- whether the
+    # growth is smooth or a widening bounce.
+    growing = 0.1 * 1.05 ** np.arange(100)
+    assert solvers.diagnose_stall(growing, 100, 20, 0.05) == "diverging"
+    rng = np.arange(100)
+    growing_bounce = 0.05 * 1.1**rng * (1.0 + 0.3 * (-1.0) ** rng)
+    assert solvers.diagnose_stall(growing_bounce, 100, 20, 0.05) == "diverging"
+
+
+file_in1 = os.path.join(
+    CUR_PATH, "test_io_data", "twist_doughnut_inputs_2.pkl"
+)
+file_in2 = os.path.join(
+    CUR_PATH, "test_io_data", "twist_doughnut_inputs_S.pkl"
+)
+file_out1 = os.path.join(
+    CUR_PATH, "test_io_data", "twist_doughnut_outputs_2.pkl"
+)
+file_out2 = os.path.join(
+    CUR_PATH, "test_io_data", "twist_doughnut_outputs_S.pkl"
+)
+
+
+@pytest.mark.parametrize(
+    "file_inputs,file_outputs",
+    [(file_in1, file_out1), (file_in2, file_out2)],
+    ids=["s<S", "s==S"],
+)
+def test_twist_doughnut(file_inputs, file_outputs):
+    """
+    Test TPI.twist_doughnut function.  Provide inputs to function and
+    ensure that output returned matches what it has been before.
+    """
+    input_tuple = utils.safe_read_pickle(file_inputs)
+    (
+        guesses,
+        r,
+        w,
+        bq,
+        rm,
+        tr,
+        theta,
+        factor,
+        ubi,
+        j,
+        s,
+        t,
+        tau_c,
+        etr_params,
+        mtrx_params,
+        mtry_params,
+        initial_b,
+    ) = input_tuple
+    p_tilde = np.ones_like(r)  # needed for multi-industry version
+    p_i = np.ones((r.shape[0], 1))  # needed for multi-industry version
+    # The pickled inputs predate the change to passing the unadjusted
+    # scalar replacement rate; they hold a constant vector over the
+    # cohort's lifetime, so take its single value.
+    assert np.unique(theta).size == 1
+    theta = float(np.unique(theta)[0])
+    p = Specifications()
+    input_tuple2 = (
+        guesses,
+        r,
+        w,
+        p_tilde,
+        p_i,
+        bq,
+        rm,
+        tr,
+        theta,
+        factor,
+        ubi,
+        j,
+        s,
+        t,
+        etr_params,
+        mtrx_params,
+        mtry_params,
+        initial_b,
+        p,
+    )
+    test_list = TPI.twist_doughnut(*input_tuple2)
+    expected_list = utils.safe_read_pickle(file_outputs)
+    assert np.allclose(np.array(test_list), np.array(expected_list), atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "tax_func_type",
+    ["DEP", "DEP_totalinc", "GS", "HSV", "linear", "mono", "mono2D"],
+    ids=["DEP", "DEP_totalinc", "GS", "HSV", "linear", "mono", "mono2D"],
+)
+def test_params_to_array(tax_func_type):
+    # Test TPI._params_to_array helper.  For numeric tax functions the
+    # nested list is converted to a numpy array; for mono/mono2D (which
+    # store callables, not numbers) the nested list is returned unchanged.
+    nested = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    result = TPI._params_to_array(nested, tax_func_type)
+    if tax_func_type in ("mono", "mono2D"):
+        assert result is nested
+    else:
+        expected = np.array(nested)
+        assert isinstance(result, np.ndarray)
+        assert np.array_equal(result, expected)
+        assert result.dtype == expected.dtype
+
+
+def test_inner_loop():
+    # Test TPI.inner_loop function.  Provide inputs to function and
+    # ensure that output returned matches what it has been before.
+    # Explicitly disable use_sparse_FOC_jac so this regression test
+    # continues to exercise the legacy dense-finite-difference path
+    # (the sparse path is covered by test_inner_loop_sparse_FOC_jac).
+    input_tuple = utils.safe_read_pickle(
+        os.path.join(CUR_PATH, "test_io_data", "tpi_inner_loop_inputs.pkl")
+    )
+    guesses, outer_loop_vars_old, initial_values, ubi, j, ind = input_tuple
+    # The pickled initial_values predates the removal of the redundant
+    # initial_b element (identical to b_splus1init) from the tuple
+    initial_values = initial_values[:4] + initial_values[5:]
+    p = Specifications()
+    p.update_specifications({"use_sparse_FOC_jac": False})
+    r = outer_loop_vars_old[0]
+    r_p = outer_loop_vars_old[2]
+    w = outer_loop_vars_old[1]
+    BQ = outer_loop_vars_old[3]
+    RM = outer_loop_vars_old[4]
+    TR = outer_loop_vars_old[5]
+    theta = outer_loop_vars_old[6]
+    p_m = np.ones((p.T + p.S, p.M))
+    outer_loop_vars = (r_p, r, w, p_m, BQ, RM, TR, theta)
+    test_tuple = TPI.inner_loop(
+        guesses, outer_loop_vars, initial_values, ubi, j, ind, p
+    )
+    expected_tuple = utils.safe_read_pickle(
+        os.path.join(CUR_PATH, "test_io_data", "tpi_inner_loop_outputs.pkl")
+    )
+
+    for i, v in enumerate(expected_tuple):
+        assert np.allclose(test_tuple[i], v)
+
+
+def test_inner_loop_sparse_FOC_jac():
+    # The optional banded (sparse finite-difference) Jacobian, enabled via
+    # use_sparse_FOC_jac, must reproduce the default dense-finite-difference
+    # household solution from test_inner_loop.
+    input_tuple = utils.safe_read_pickle(
+        os.path.join(CUR_PATH, "test_io_data", "tpi_inner_loop_inputs.pkl")
+    )
+    guesses, outer_loop_vars_old, initial_values, ubi, j, ind = input_tuple
+    # The pickled initial_values predates the removal of the redundant
+    # initial_b element (identical to b_splus1init) from the tuple
+    initial_values = initial_values[:4] + initial_values[5:]
+    p = Specifications()
+    p.update_specifications({"use_sparse_FOC_jac": True})
+    r = outer_loop_vars_old[0]
+    r_p = outer_loop_vars_old[2]
+    w = outer_loop_vars_old[1]
+    BQ = outer_loop_vars_old[3]
+    RM = outer_loop_vars_old[4]
+    TR = outer_loop_vars_old[5]
+    theta = outer_loop_vars_old[6]
+    p_m = np.ones((p.T + p.S, p.M))
+    outer_loop_vars = (r_p, r, w, p_m, BQ, RM, TR, theta)
+    test_tuple = TPI.inner_loop(
+        guesses, outer_loop_vars, initial_values, ubi, j, ind, p
+    )
+    expected_tuple = utils.safe_read_pickle(
+        os.path.join(CUR_PATH, "test_io_data", "tpi_inner_loop_outputs.pkl")
+    )
+
+    for i, v in enumerate(expected_tuple):
+        assert np.allclose(test_tuple[i], v)
+
+
+filename1 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline.pkl"
+)
+param_updates2 = {"budget_balance": True, "alpha_G": [0.0], "zeta_D": [0.0]}
+filename2 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline_balanced_budget.pkl"
+)
+filename3 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_reform.pkl"
+)
+param_updates4 = {"baseline_spending": True}
+filename4 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_reform_baseline_spend.pkl"
+)
+param_updates5 = {"zeta_K": [1.0], "initial_guess_r_SS": 0.04}
+filename5 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline_small_open.pkl"
+)
+param_updates6 = {
+    "zeta_K": [0.2, 0.2, 0.2, 1.0, 1.0, 1.0, 0.2],
+    "initial_guess_r_SS": 0.10,
+}
+filename6 = os.path.join(
+    CUR_PATH,
+    "test_io_data",
+    "run_TPI_outputs_baseline_small_open_some_periods.pkl",
+)
+param_updates7 = {
+    "delta_tau_annual": [[0.0]],
+    "zeta_K": [0.0],
+    "zeta_D": [0.0],
+    "initial_guess_r_SS": 0.015,
+}
+filename7 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline_delta_tau0.pkl"
+)
+param_updates8 = {
+    "delta_g_annual": 0.02,
+    "alpha_I": [0.01],
+    "gamma_g": [0.07],
+    "initial_Kg_ratio": 0.15,
+    "initial_guess_r_SS": 0.06,
+    "initial_guess_TR_SS": 0.03,
+}
+filename8 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline_Kg_nonzero.pkl"
+)
+param_updates9 = {
+    "frisch": 0.41,
+    "cit_rate": [[0.21, 0.25, 0.35]],
+    "M": 3,
+    "I": 3,
+    "io_matrix": np.eye(3),
+    "epsilon": [1.0, 1.0, 1.0],
+    "gamma": [0.3, 0.35, 0.4],
+    "gamma_g": [0.1, 0.05, 0.15],
+    "alpha_c": [0.2, 0.4, 0.4],
+    "c_min": [0.0, 0.0, 0.0],
+    "initial_guess_r_SS": 0.11,
+    "initial_guess_TR_SS": 0.07,
+    "alpha_I": [0.01],
+    "initial_Kg_ratio": 0.01,
+    "debt_ratio_ss": 1.5,
+}
+filename9 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_baseline_M3_Kg_nonzero.pkl"
+)
+alpha_T = np.zeros(50)  # Adjusting the path of transfer spending
+alpha_T[0:2] = 0.09
+alpha_T[2:10] = 0.09 + 0.01
+alpha_T[10:40] = 0.09 - 0.01
+alpha_T[40:] = 0.09
+alpha_G = np.zeros(7)  # Adjusting the path of non-transfer spending
+alpha_G[0:3] = 0.05 - 0.01
+alpha_G[3:6] = 0.05 - 0.005
+alpha_G[6:] = 0.05
+param_updates10 = {
+    "start_year": 2023,
+    "budget_balance": True,
+    "frisch": 0.41,
+    "cit_rate": [[0.21, 0.25, 0.35]],
+    "M": 3,
+    "I": 3,
+    "io_matrix": np.eye(3),
+    "epsilon": [1.0, 1.0, 1.0],
+    "gamma": [0.3, 0.35, 0.4],
+    "gamma_g": [0.0, 0.0, 0.0],
+    "alpha_c": [0.2, 0.4, 0.4],
+    "c_min": [0.0, 0.0, 0.0],
+    "initial_guess_r_SS": 0.11,
+    "initial_guess_TR_SS": 0.07,
+    "debt_ratio_ss": 1.5,
+    "alpha_T": alpha_T.tolist(),
+    "alpha_G": alpha_G.tolist(),
+}
+filename10 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_baseline_M3_Kg_zero.pkl"
+)
+param_updates11 = {
+    "start_year": 2023,
+    "budget_balance": True,
+    "frisch": 0.41,
+    "cit_rate": [[0.21, 0.25, 0.35]],
+    "M": 3,
+    "I": 4,
+    "io_matrix": np.array(
+        [
+            [0.3, 0.3, 0.4],
+            [0.6, 0.1, 0.3],
+            [0.25, 0.5, 0.25],
+            [0.0, 1.0, 0.0],
+        ]
+    ),
+    "epsilon": [1.0, 1.0, 1.0],
+    "gamma": [0.3, 0.35, 0.4],
+    "gamma_g": [0.0, 0.0, 0.0],
+    "alpha_c": [0.2, 0.4, 0.3, 0.1],
+    "c_min": [0.0, 0.0, 0.0, 0.0],
+    "initial_guess_r_SS": 0.11,
+    "initial_guess_TR_SS": 0.07,
+    "debt_ratio_ss": 1.5,
+    "alpha_T": alpha_T.tolist(),
+    "alpha_G": alpha_G.tolist(),
+}
+filename11 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_baseline_MneI.pkl"
+)
+param_updates12 = {
+    "start_year": 2023,
+    "budget_balance": True,
+    "frisch": 0.41,
+    "cit_rate": [[0.21, 0.25, 0.35]],
+    "M": 3,
+    "I": 4,
+    "io_matrix": np.array(
+        [
+            [0.3, 0.3, 0.4],
+            [0.6, 0.1, 0.3],
+            [0.25, 0.5, 0.25],
+            [0.0, 1.0, 0.0],
+        ]
+    ),
+    "epsilon": [1.0, 1.0, 1.0],
+    "gamma": [0.3, 0.35, 0.4],
+    "gamma_g": [0.0, 0.0, 0.0],
+    "alpha_c": [0.2, 0.4, 0.3, 0.1],
+    "c_min": [0.001, 0.0002, 0.0, 0.0003],
+    "initial_guess_r_SS": 0.11,
+    "initial_guess_TR_SS": 0.07,
+    "debt_ratio_ss": 1.5,
+    "alpha_T": alpha_T.tolist(),
+    "alpha_G": alpha_G.tolist(),
+}
+filename12 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_baseline_MneI_cmin.pkl"
+)
+
+
+@pytest.mark.local
+@pytest.mark.parametrize(
+    "baseline,param_updates,filename",
+    [
+        (True, param_updates2, filename2),
+        (True, {"initial_guess_r_SS": 0.035}, filename1),
+        (False, {}, filename3),
+        (False, param_updates4, filename4),
+        (True, param_updates5, filename5),
+        (True, param_updates6, filename6),
+        (True, param_updates7, filename7),
+        (True, param_updates8, filename8),
+        (True, param_updates9, filename9),
+        (True, param_updates10, filename10),
+        (True, param_updates11, filename11),
+        (True, param_updates12, filename12),
+    ],
+    ids=[
+        "Baseline, balanced budget",
+        "Baseline",
+        "Reform",
+        "Reform, baseline spending",
+        "Baseline, small open",
+        "Baseline, small open some periods",
+        "Baseline, delta_tau = 0",
+        "Baseline, Kg > 0",
+        "Baseline, M=3 non-zero Kg",
+        "Baseline, M=3 zero Kg",
+        "Baseline, M!=I",
+        "Baseline, M!=I, cmin>0",
+    ],
+)
+def test_run_TPI_full_run(
+    baseline, param_updates, filename, tmpdir, dask_client
+):
+    """
+    Test TPI.run_TPI function.  Provide inputs to function and
+    ensure that output returned matches what it has been before.
+    """
+    if baseline:
+        baseline_dir = os.path.join(tmpdir, "baseline")
+        output_base = baseline_dir
+    else:
+        old_baseline_dir = os.path.join(CUR_PATH, "test_io_data", "OUTPUT")
+        ss_vars = utils.safe_read_pickle(
+            os.path.join(old_baseline_dir, "SS", "SS_vars.pkl")
+        )
+        ss_vars_new = {}
+        for k, v in ss_vars.items():
+            ss_vars_new[SS_VAR_NAME_MAPPING.get(k, k)] = v
+        tpi_vars = utils.safe_read_pickle(
+            os.path.join(old_baseline_dir, "TPI", "TPI_vars.pkl")
+        )
+        tpi_vars_new = {}
+        for k, v in tpi_vars.items():
+            tpi_vars_new[VAR_NAME_MAPPING.get(k, k)] = v
+        baseline_dir = os.path.join(tmpdir, "baseline")
+        ss_dir = os.path.join(baseline_dir, "SS")
+        utils.mkdirs(ss_dir)
+        tpi_dir = os.path.join(baseline_dir, "TPI")
+        utils.mkdirs(tpi_dir)
+        ss_path = os.path.join(baseline_dir, "SS", "SS_vars.pkl")
+        with open(ss_path, "wb") as f:
+            pickle.dump(ss_vars_new, f)
+        tpi_path = os.path.join(baseline_dir, "TPI", "TPI_vars.pkl")
+        with open(tpi_path, "wb") as f:
+            pickle.dump(tpi_vars_new, f)
+        output_base = os.path.join(tmpdir, "reform")
+
+    p = Specifications(
+        baseline=baseline,
+        baseline_dir=baseline_dir,
+        output_base=output_base,
+        num_workers=NUM_WORKERS,
+    )
+    p.update_specifications(param_updates)
+
+    # Need to run SS first to get results
+    SS.ENFORCE_SOLUTION_CHECKS = True
+    ss_outputs = SS.run_SS(p, client=dask_client)
+    # ss_outputs = SS.run_SS(p, client=None)
+
+    if p.baseline:
+        utils.mkdirs(os.path.join(p.baseline_dir, "SS"))
+        ss_dir = os.path.join(p.baseline_dir, "SS", "SS_vars.pkl")
+        with open(ss_dir, "wb") as f:
+            pickle.dump(ss_outputs, f)
+    else:
+        utils.mkdirs(os.path.join(p.output_base, "SS"))
+        ss_dir = os.path.join(p.output_base, "SS", "SS_vars.pkl")
+        with open(ss_dir, "wb") as f:
+            pickle.dump(ss_outputs, f)
+
+    test_dict = TPI.run_TPI(p, client=dask_client)
+    expected_dict = utils.safe_read_pickle(filename)
+    try:
+        expected_dict["r_p"] = expected_dict.pop("r_hh")
+        test_dict["euler_savings"] = (
+            test_dict["euler_savings"][:, :, :].max(1).max(1)
+        )
+        test_dict["euler_labor_leisure"] = (
+            test_dict["euler_labor_leisure"][:, :, :].max(1).max(1)
+        )
+    except KeyError:
+        pass
+
+    # if old variable names, update keys with VAR_NAME_MAPPING
+    if "Y_vec" in expected_dict.keys():
+        expected_dict_updated = {}
+        for k, v in expected_dict.items():
+            expected_dict_updated[VAR_NAME_MAPPING.get(k, k)] = v
+        expected_dict = expected_dict_updated
+
+    for k, v in expected_dict.items():
+        print("Testing, ", k)
+        if np.ndim(v) == 0:  # scalar outputs such as factor
+            print("Diff = ", np.abs(test_dict[k] - v))
+            continue
+        try:
+            print(
+                "Diff = ",
+                np.abs(test_dict[k][: p.T] - v[: p.T]).max(),
+            )
+        except ValueError:
+            print(
+                "Diff = ",
+                np.abs(test_dict[k][: p.T, :, :] - v[: p.T, :, :]).max(),
+            )
+
+    for k, v in expected_dict.items():
+        print("Testing, ", k)
+        if np.ndim(v) == 0:  # scalar outputs such as factor
+            assert np.allclose(test_dict[k], v, rtol=1e-04, atol=1e-04)
+            continue
+        try:
+            print(
+                "Diff = ",
+                np.abs(test_dict[k][: p.T] - v[: p.T]).max(),
+            )
+            if np.abs(test_dict[k][: p.T] - v[: p.T]).max() > 1e-5:
+                # print the indices where the difference is large
+                indices = np.where(
+                    np.abs(test_dict[k][: p.T] - v[: p.T]) > 1e-5
+                )
+                print("Indices with large difference:", indices)
+            assert np.allclose(
+                test_dict[k][: p.T],
+                v[: p.T],
+                rtol=1e-04,
+                atol=1e-04,
+            )
+        except ValueError:
+            print(
+                "Diff = ",
+                np.abs(test_dict[k][: p.T, :, :] - v[: p.T, :, :]).max(),
+            )
+            if np.abs(test_dict[k][: p.T, :, :] - v[: p.T, :, :]).max() > 1e-5:
+                # print the indices where the difference is large
+                indices = np.where(
+                    np.abs(test_dict[k][: p.T, :, :] - v[: p.T, :, :]) > 1e-5
+                )
+                print("Indices with large difference:", indices)
+            assert np.allclose(
+                test_dict[k][: p.T, :, :],
+                v[: p.T, :, :],
+                rtol=1e-04,
+                atol=1e-04,
+            )
+
+
+filename1 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline_2.pkl"
+)
+param_updates2 = {"budget_balance": True, "alpha_G": [0.0], "zeta_D": [0.0]}
+filename2 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline_balanced_budget_2.pkl"
+)
+filename3 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_reform_2.pkl"
+)
+param_updates4 = {"baseline_spending": True}
+filename4 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_reform_baseline_spend_2.pkl"
+)
+
+
+def _initial_hhwealth_dist():
+    """
+    An S x J initial distribution of wealth for tests of the initial
+    wealth parameters: each cell's share of aggregate wealth, built from
+    the steady-state savings of the tests' baseline fixture tilted
+    toward older ages, weighted by the period-0 population, and
+    normalized to sum to one. Weighting by population makes these shares
+    of aggregate wealth (what initial_hhwealth_dist means), so per-capita
+    wealth stays close to the steady state and the household problems of
+    the cohorts alive at t=0 stay well posed.
+    """
+    ss_vars = utils.safe_read_pickle(
+        os.path.join(CUR_PATH, "test_io_data", "OUTPUT2", "SS", "SS_vars.pkl")
+    )
+    b_sp1 = np.asarray(ss_vars[SS_VAR_NAME_MAPPING.get("b_sp1", "b_sp1")])
+    p = Specifications()
+    p.update_specifications(TEST_PARAM_DICT)
+    S = b_sp1.shape[0]
+    tilt = 1.0 + 0.3 * (np.arange(S) / (S - 1) - 0.5)
+    dist = b_sp1 * tilt.reshape(S, 1) * p.omega[0, :, :]
+    return (dist / dist.sum()).tolist()
+
+
+param_updates_iw = {
+    "initial_wealth_ratio": 3.0,
+    "initial_hhwealth_dist": _initial_hhwealth_dist(),
+}
+filename_iw = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline_initial_wealth.pkl"
+)
+
+
+@pytest.mark.parametrize(
+    "baseline,param_updates,filename",
+    [
+        (True, {}, filename1),
+        (False, {}, filename3),
+        (True, param_updates_iw, filename_iw),
+    ],
+    ids=["Baseline", "Reform", "Baseline, initial wealth parameters"],
+)
+def test_run_TPI(baseline, param_updates, filename, tmpdir, dask_client):
+    """
+    Test TPI.run_TPI function.  Provide inputs to function and
+    ensure that output returned matches what it has been before.
+    """
+    if baseline:
+        baseline_dir = os.path.join(tmpdir, "baseline")
+        output_base = baseline_dir
+    else:
+        # If running reform, used cached baseline results
+        old_baseline_dir = os.path.join(CUR_PATH, "test_io_data", "OUTPUT2")
+        # map new var names and save to tmpdir
+        ss_vars = utils.safe_read_pickle(
+            os.path.join(old_baseline_dir, "SS", "SS_vars.pkl")
+        )
+        ss_vars_new = {}
+        for k, v in ss_vars.items():
+            ss_vars_new[SS_VAR_NAME_MAPPING.get(k, k)] = v
+        tpi_vars = utils.safe_read_pickle(
+            os.path.join(old_baseline_dir, "TPI", "TPI_vars.pkl")
+        )
+        tpi_vars_new = {}
+        for k, v in tpi_vars.items():
+            tpi_vars_new[VAR_NAME_MAPPING.get(k, k)] = v
+        baseline_dir = os.path.join(tmpdir, "baseline")
+        ss_dir = os.path.join(baseline_dir, "SS")
+        utils.mkdirs(ss_dir)
+        tpi_dir = os.path.join(baseline_dir, "TPI")
+        utils.mkdirs(tpi_dir)
+        ss_path = os.path.join(baseline_dir, "SS", "SS_vars.pkl")
+        with open(ss_path, "wb") as f:
+            pickle.dump(ss_vars_new, f)
+        tpi_path = os.path.join(baseline_dir, "TPI", "TPI_vars.pkl")
+        with open(tpi_path, "wb") as f:
+            pickle.dump(tpi_vars_new, f)
+        output_base = os.path.join(tmpdir, "reform")
+    p = Specifications(
+        baseline=baseline,
+        baseline_dir=baseline_dir,
+        output_base=output_base,
+        num_workers=NUM_WORKERS,
+    )
+    test_params = TEST_PARAM_DICT.copy()
+    test_params.update(param_updates)
+    p.update_specifications(test_params)
+    p.maxiter = 2  # this test runs through just two iterations
+
+    # Need to run SS first to get results
+    SS.ENFORCE_SOLUTION_CHECKS = False
+    # ss_outputs = SS.run_SS(p, client=dask_client)
+    ss_outputs = SS.run_SS(p, client=None)
+
+    if p.baseline:
+        utils.mkdirs(os.path.join(p.baseline_dir, "SS"))
+        ss_dir = os.path.join(p.baseline_dir, "SS", "SS_vars.pkl")
+        with open(ss_dir, "wb") as f:
+            pickle.dump(ss_outputs, f)
+    else:
+        utils.mkdirs(os.path.join(p.output_base, "SS"))
+        ss_dir = os.path.join(p.output_base, "SS", "SS_vars.pkl")
+        with open(ss_dir, "wb") as f:
+            pickle.dump(ss_outputs, f)
+
+    TPI.ENFORCE_SOLUTION_CHECKS = False
+    test_dict = TPI.run_TPI(p, client=dask_client)
+    expected_dict = utils.safe_read_pickle(filename)
+
+    for k, v in expected_dict.items():
+        print("Max diff in ", k, " = ")
+        if np.ndim(v) == 0:  # scalar outputs such as factor
+            print(np.absolute(test_dict[VAR_NAME_MAPPING.get(k, k)] - v))
+            continue
+        try:
+            print(
+                np.absolute(
+                    test_dict[VAR_NAME_MAPPING.get(k, k)][: p.T] - v[: p.T]
+                ).max()
+            )
+        except ValueError:
+            print(
+                np.absolute(
+                    test_dict[VAR_NAME_MAPPING.get(k, k)][: p.T, :, :]
+                    - v[: p.T, :, :]
+                ).max()
+            )
+
+    for k, v in expected_dict.items():
+        if np.ndim(v) == 0:  # scalar outputs such as factor
+            assert np.allclose(
+                test_dict[VAR_NAME_MAPPING.get(k, k)],
+                v,
+                rtol=1e-04,
+                atol=1e-04,
+            )
+            continue
+        try:
+            assert np.allclose(
+                test_dict[VAR_NAME_MAPPING.get(k, k)][: p.T],
+                v[: p.T],
+                rtol=1e-04,
+                atol=1e-04,
+            )
+        except ValueError:
+            assert np.allclose(
+                test_dict[VAR_NAME_MAPPING.get(k, k)][: p.T, :, :],
+                v[: p.T, :, :],
+                rtol=1e-04,
+                atol=1e-04,
+            )
+
+
+param_updates5 = {"zeta_K": [1.0]}
+filename5 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline_small_open_2.pkl"
+)
+param_updates6 = {
+    "zeta_K": [0.2, 0.2, 0.2, 1.0, 1.0, 1.0, 0.2],
+    "initial_guess_r_SS": 0.10,
+}
+filename6 = filename = os.path.join(
+    CUR_PATH,
+    "test_io_data",
+    "run_TPI_outputs_baseline_small_open_some_periods_2.pkl",
+)
+param_updates7 = {
+    "delta_tau_annual": [[0.0]],
+    "zeta_K": [0.0],
+    "zeta_D": [0.0],
+    "initial_guess_r_SS": 0.01,
+}
+filename7 = filename = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline_delta_tau0_2.pkl"
+)
+param_updates8 = {
+    "delta_g_annual": 0.02,
+    "alpha_I": [0.01],
+    "gamma_g": [0.07],
+    "initial_Kg_ratio": 0.15,
+    "initial_guess_r_SS": 0.06,
+    "initial_guess_TR_SS": 0.03,
+}
+filename8 = os.path.join(
+    CUR_PATH, "test_io_data", "run_TPI_outputs_baseline_Kg_nonzero_2.pkl"
+)
+param_updates10 = {
+    "J": 1,
+    "lambdas": np.array([1.0]),
+    "e": np.ones((40, 1)),
+    "beta_annual": [0.96],
+    "chi_b": [80],
+    "labor_income_tax_noncompliance_rate": [[0.0]],
+    "capital_income_tax_noncompliance_rate": [[0.0]],
+    "income_tax_filer": [[1]],
+    "wealth_tax_filer": [[1]],
+    "eta": np.ones((40, 1)) * (1 / 40),
+    "eta_RM": np.ones((40, 1)) * (1 / 40),
+    "replacement_rate_adjust": [[1.0]],
+    # Collapse J dimension from TEST_PARAM_DICT (J=2) to J=1
+    # omega arrays: sum over J (joint distribution marginal)
+    "omega": np.array(TEST_PARAM_DICT["omega"]).sum(-1, keepdims=True),
+    "omega_SS": np.array(TEST_PARAM_DICT["omega_SS"]).sum(-1, keepdims=True),
+    "omega_S_preTP": np.array(TEST_PARAM_DICT["omega_S_preTP"]).sum(
+        -1, keepdims=True
+    ),
+    # rho/imm_rates: same across J, so just take first slice
+    "rho": np.array(TEST_PARAM_DICT["rho"])[:, :, 0:1],
+    "rho_preTP": np.array(TEST_PARAM_DICT["rho_preTP"])[:, 0:1],
+    "imm_rates": np.array(TEST_PARAM_DICT["imm_rates"])[:, :, 0:1],
+    "imm_rates_preTP": np.array(TEST_PARAM_DICT["imm_rates_preTP"])[:, 0:1],
+}
+filename10 = os.path.join(CUR_PATH, "test_io_data", "run_TPI_outputs_J1.pkl")
+# Defined Benefits pension system: the first doughnut ring passes t=None
+# with method 'TPI_scalar' into pensions.DB_amount, which must treat it
+# as period 0; the full time path exercises the 1-, 2-, and 3-dim loops
+param_updates11 = {
+    "pension_system": "Defined Benefits",
+    "alpha_db": [[0.02]],
+    "yr_contrib": 35,
+    "avg_earn_num_years": 40,
+}
+filename11 = os.path.join(CUR_PATH, "test_io_data", "run_TPI_outputs_DB.pkl")
+# read in mono tax funcs (not age specific)
+if sys.version_info[1] < 11:
+    dict_params = utils.safe_read_pickle(
+        os.path.join(CUR_PATH, "test_io_data", "TxFuncEst_mono_nonage.pkl")
+    )
+    p = Specifications()
+    etr_params = [[None] * p.S] * p.T
+    mtrx_params = [[None] * p.S] * p.T
+    mtry_params = [[None] * p.S] * p.T
+    for s in range(p.S):
+        for t in range(p.T):
+            if t < p.BW:
+                etr_params[t][s] = dict_params["tfunc_etr_params_S"][t][s]
+                mtrx_params[t][s] = dict_params["tfunc_mtrx_params_S"][t][s]
+                mtry_params[t][s] = dict_params["tfunc_mtry_params_S"][t][s]
+            else:
+                etr_params[t][s] = dict_params["tfunc_etr_params_S"][-1][s]
+                mtrx_params[t][s] = dict_params["tfunc_mtrx_params_S"][-1][s]
+                mtry_params[t][s] = dict_params["tfunc_mtry_params_S"][-1][s]
+    param_updates9 = {
+        "tax_func_type": "mono",
+        "etr_params": etr_params,
+        "mtrx_params": mtrx_params,
+        "mtry_params": mtry_params,
+    }
+    filename9 = os.path.join(
+        CUR_PATH, "test_io_data", "run_TPI_outputs_mono_2.pkl"
+    )
+
+
+if sys.version_info[1] < 11:
+    test_list = [
+        (True, param_updates2, filename2),
+        (True, param_updates5, filename5),
+        (True, param_updates6, filename6),
+        (True, param_updates7, filename7),
+        (True, {}, filename1),
+        (False, param_updates4, filename4),
+        (True, param_updates8, filename8),
+        (True, param_updates9, filename9),
+        (True, param_updates11, filename11),
+    ]
+    id_list = [
+        "Baseline, balanced budget",
+        "Baseline, small open",
+        "Baseline, small open for some periods",
+        "Baseline, delta_tau = 0",
+        "Baseline",
+        "Reform, baseline spending",
+        "Baseline, Kg>0",
+        "mono tax functions",
+        "Baseline, Defined Benefits pension",
+    ]
+else:
+    test_list = [
+        (True, param_updates2, filename2),
+        (True, param_updates5, filename5),
+        (True, param_updates6, filename6),
+        (True, param_updates7, filename7),
+        (True, {}, filename1),
+        (False, param_updates4, filename4),
+        (True, param_updates8, filename8),
+        (True, param_updates10, filename10),
+        (True, param_updates11, filename11),
+    ]
+    id_list = [
+        "Baseline, balanced budget",
+        "Baseline, small open",
+        "Baseline, small open for some periods",
+        "Baseline, delta_tau = 0",
+        "Baseline",
+        "Reform, baseline spending",
+        "Baseline, Kg>0",
+        "J=1",
+        "Baseline, Defined Benefits pension",
+    ]
+
+
+@pytest.mark.local
+@pytest.mark.parametrize(
+    "baseline,param_updates,filename",
+    test_list,
+    ids=id_list,
+)
+def test_run_TPI_extra(baseline, param_updates, filename, tmpdir, dask_client):
+    """
+    Test TPI.run_TPI function.  Provide inputs to function and
+    ensure that output returned matches what it has been before.
+    """
+    if baseline:
+        baseline_dir = os.path.join(tmpdir, "baseline")
+        output_base = baseline_dir
+    else:
+        old_baseline_dir = os.path.join(CUR_PATH, "test_io_data", "OUTPUT2")
+        ss_vars = utils.safe_read_pickle(
+            os.path.join(old_baseline_dir, "SS", "SS_vars.pkl")
+        )
+        ss_vars_new = {}
+        for k, v in ss_vars.items():
+            ss_vars_new[SS_VAR_NAME_MAPPING.get(k, k)] = v
+        tpi_vars = utils.safe_read_pickle(
+            os.path.join(old_baseline_dir, "TPI", "TPI_vars.pkl")
+        )
+        tpi_vars_new = {}
+        for k, v in tpi_vars.items():
+            tpi_vars_new[VAR_NAME_MAPPING.get(k, k)] = v
+        baseline_dir = os.path.join(tmpdir, "baseline")
+        ss_dir = os.path.join(baseline_dir, "SS")
+        utils.mkdirs(ss_dir)
+        tpi_dir = os.path.join(baseline_dir, "TPI")
+        utils.mkdirs(tpi_dir)
+        ss_path = os.path.join(baseline_dir, "SS", "SS_vars.pkl")
+        with open(ss_path, "wb") as f:
+            pickle.dump(ss_vars_new, f)
+        tpi_path = os.path.join(baseline_dir, "TPI", "TPI_vars.pkl")
+        with open(tpi_path, "wb") as f:
+            pickle.dump(tpi_vars_new, f)
+        output_base = os.path.join(tmpdir, "reform")
+    p = Specifications(
+        baseline=baseline,
+        baseline_dir=baseline_dir,
+        output_base=output_base,
+        num_workers=NUM_WORKERS,
+    )
+    test_dict = TEST_PARAM_DICT.copy()
+    test_dict.update(param_updates)
+    p.update_specifications(test_dict)
+    p.maxiter = 2  # this test runs through just two iterations
+
+    # Need to run SS first to get results
+    SS.ENFORCE_SOLUTION_CHECKS = False
+    ss_outputs = SS.run_SS(p, client=dask_client)
+
+    if p.baseline:
+        utils.mkdirs(os.path.join(p.baseline_dir, "SS"))
+        ss_path = os.path.join(p.baseline_dir, "SS", "SS_vars.pkl")
+        with open(ss_path, "wb") as f:
+            pickle.dump(ss_outputs, f)
+    else:
+        utils.mkdirs(os.path.join(p.output_base, "SS"))
+        ss_path = os.path.join(p.output_base, "SS", "SS_vars.pkl")
+        with open(ss_path, "wb") as f:
+            pickle.dump(ss_outputs, f)
+
+    TPI.ENFORCE_SOLUTION_CHECKS = False
+    test_dict = TPI.run_TPI(p, client=dask_client)
+    expected_dict = utils.safe_read_pickle(filename)
+
+    # if old variable names, update keys with VAR_NAME_MAPPING
+    if "Y_vec" in expected_dict.keys():
+        expected_dict_updated = {}
+        for k, v in expected_dict.items():
+            expected_dict_updated[VAR_NAME_MAPPING.get(k, k)] = v
+        expected_dict = expected_dict_updated
+
+    for k, v in expected_dict.items():
+        print("Checking ", k)
+        if np.ndim(v) == 0:  # scalar outputs such as factor
+            print("Diff = ", np.absolute(test_dict[k] - v))
+            assert np.allclose(test_dict[k], v, rtol=1e-04, atol=1e-04)
+            continue
+        try:
+            print(
+                "Diff = ",
+                np.absolute(test_dict[k][: p.T] - v[: p.T]).max(),
+            )
+            assert np.allclose(
+                test_dict[k][: p.T],
+                v[: p.T],
+                rtol=1e-04,
+                atol=1e-04,
+            )
+        except ValueError:
+            print(
+                "Diff = ",
+                np.absolute(test_dict[k][: p.T, :, :] - v[: p.T, :, :]).max(),
+            )
+            assert np.allclose(
+                test_dict[k][: p.T, :, :],
+                v[: p.T, :, :],
+                rtol=1e-04,
+                atol=1e-04,
+            )
+
+
+class _ReachedTPILoop(Exception):
+    """Sentinel raised in place of the household inner loop."""
+
+
+def test_run_TPI_serial_no_client(tmpdir, monkeypatch):
+    """
+    Regression test: TPI.run_TPI(p, client=None) must reach the TPI loop.
+
+    run_TPI used to call ``client.scatter(p, broadcast=True)``
+    unconditionally, so passing ``client=None`` raised an
+    ``AttributeError`` before the TPI loop was ever entered, making the
+    serial fallback inside the loop unreachable.  This test does not
+    solve a transition path: it seeds the baseline SS results from the
+    cached pickles in ``test_io_data`` and monkeypatches
+    ``TPI.inner_loop`` to raise a sentinel, so it asserts only that
+    execution gets as far as the first serial household solve.
+    """
+    # Seed cached baseline SS results so no SS solve is needed
+    old_baseline_dir = os.path.join(CUR_PATH, "test_io_data", "OUTPUT2")
+    ss_vars = utils.safe_read_pickle(
+        os.path.join(old_baseline_dir, "SS", "SS_vars.pkl")
+    )
+    ss_vars_new = {
+        SS_VAR_NAME_MAPPING.get(k, k): v for k, v in ss_vars.items()
+    }
+    baseline_dir = os.path.join(tmpdir, "baseline")
+    utils.mkdirs(os.path.join(baseline_dir, "SS"))
+    with open(os.path.join(baseline_dir, "SS", "SS_vars.pkl"), "wb") as f:
+        pickle.dump(ss_vars_new, f)
+
+    p = Specifications(
+        baseline=True,
+        baseline_dir=baseline_dir,
+        output_base=baseline_dir,
+        num_workers=1,
+    )
+    p.update_specifications(TEST_PARAM_DICT.copy())
+    p.maxiter = 1
+
+    def mock_inner_loop(*args, **kwargs):
+        raise _ReachedTPILoop()
+
+    monkeypatch.setattr(TPI, "inner_loop", mock_inner_loop)
+
+    with pytest.raises(_ReachedTPILoop):
+        TPI.run_TPI(p, client=None)
+
+
+@pytest.mark.local
+@pytest.mark.parametrize(
+    "system_params,regime_params",
+    [
+        ({}, {}),
+        (
+            {
+                "pension_system": "Defined Benefits",
+                "alpha_db": [[0.02]],
+                "yr_contrib": 35,
+                "avg_earn_num_years": 30,
+            },
+            {"alpha_db": 0.015, "avg_earn_num_years": 35, "yr_contrib": 30},
+        ),
+        (
+            {
+                "pension_system": "Notional Defined Contribution",
+                "tau_p": 0.1,
+                "ndc_growth_rate": "LR GDP",
+                "dir_growth_rate": "LR GDP",
+            },
+            {"tau_p": 0.12, "k_ret": 0.3},
+        ),
+        (
+            {
+                "pension_system": "Notional Defined Contribution",
+                "tau_p": 0.1,
+                "ndc_growth_rate": "Curr GDP",
+                "ndc_growth_avg_years": 6,
+                "dir_growth_rate": "wage bill",
+            },
+            {"tau_p": 0.12, "k_ret": 0.3},
+        ),
+    ],
+    ids=[
+        "US-Style Social Security",
+        "Defined Benefits",
+        "NDC",
+        "NDC growth paths",
+    ],
+)
+def test_run_TPI_pension_regime(
+    system_params, regime_params, tmpdir, dask_client
+):
+    """
+    A grandfathered regime that raises the retirement age (and, for the
+    DB and NDC systems, changes the benefit formula) runs through the
+    time path, and the saved pension benefits start at each cohort's
+    own retirement period: later for cohorts the regime covers,
+    unchanged for the rest.
+    """
+    baseline_dir = os.path.join(tmpdir, "baseline")
+    p = Specifications(
+        baseline=True,
+        baseline_dir=baseline_dir,
+        output_base=baseline_dir,
+        num_workers=NUM_WORKERS,
+    )
+    test_params = TEST_PARAM_DICT.copy()
+    test_params.update(system_params)
+    test_params["pension_regimes"] = [
+        dict(
+            {
+                "year": p.start_year + 10,
+                "max_age_at_start": 54,
+                "retirement_age": 67,
+            },
+            **regime_params,
+        )
+    ]
+    p.update_specifications(test_params)
+    p.maxiter = 2  # two iterations are enough to exercise the paths
+    assert len(np.unique(p.retire)) == 2
+
+    SS.ENFORCE_SOLUTION_CHECKS = False
+    ss_outputs = SS.run_SS(p, client=None)
+    utils.mkdirs(os.path.join(p.baseline_dir, "SS"))
+    with open(os.path.join(p.baseline_dir, "SS", "SS_vars.pkl"), "wb") as f:
+        pickle.dump(ss_outputs, f)
+    TPI.ENFORCE_SOLUTION_CHECKS = False
+    tpi_vars = TPI.run_TPI(p, client=dask_client)
+    pension = tpi_vars["pension_benefits"]  # (T, S, J)
+    assert pension.shape == (p.T, p.S, p.J)
+
+    def first_paid(t, length):
+        # cohort of age S - length in period t, followed until age S - 1
+        diag = np.diagonal(pension[t : t + p.S, :, 0], offset=p.S - length)
+        retire = np.diagonal(p.retire[t : t + p.S, :], offset=p.S - length)
+        s0 = p.S - length
+        assert np.all(diag[: retire[-1] - s0] == 0.0)
+        assert np.all(diag[retire[-1] - s0 :] > 0.0)
+        return int(retire[-1])
+
+    base = int(p.retire[0, 0])
+    raised = int(p.retire[-1, 0])
+    assert raised > base
+    # born after the regime starts, and aged 50 or 60 (in years) when it
+    # starts, with two years per period in this S = 40 model
+    years_per_period = 80 / p.S
+    t_switch = int(10 / years_per_period)
+    born_later = first_paid(t_switch + 2, p.S)
+    young = first_paid(
+        0, p.S - int((50 - 10 - p.starting_age) / years_per_period)
+    )
+    old = first_paid(
+        0, p.S - int((60 - 10 - p.starting_age) / years_per_period)
+    )
+    assert (born_later, young, old) == (raised, raised, base)

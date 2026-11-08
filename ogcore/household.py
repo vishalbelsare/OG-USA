@@ -1,22 +1,44 @@
-'''
+"""
 ------------------------------------------------------------------------
 Household functions.
 ------------------------------------------------------------------------
-'''
+"""
 
 # Packages
 import numpy as np
 from ogcore import tax, utils
+import logging
 
-'''
+logger = logging.getLogger(__name__)
+
+"""
 ------------------------------------------------------------------------
     Functions
 ------------------------------------------------------------------------
-'''
+"""
+
+
+def _get_e_long(p):
+    """Return ``p.e`` extended for the TPI transition window.
+
+    ``e_long`` is a pure function of ``p.e`` / ``p.S`` / ``p.J`` -- none of
+    which change during a solve -- so it is built once and cached on the
+    parameters object. ``FOC_savings`` and ``FOC_labor`` previously rebuilt
+    this array on every call, which profiling identified as the single most
+    expensive operation in a TPI run.
+    """
+    e_long = getattr(p, "_e_long_cache", None)
+    if e_long is None:
+        e_long = np.concatenate(
+            (p.e, np.tile(p.e[-1, :, :].reshape(1, p.S, p.J), (p.S, 1, 1))),
+            axis=0,
+        )
+        p._e_long_cache = e_long
+    return e_long
 
 
 def marg_ut_cons(c, sigma):
-    r'''
+    r"""
     Compute the marginal utility of consumption.
 
     .. math::
@@ -29,7 +51,7 @@ def marg_ut_cons(c, sigma):
     Returns:
         output (array_like): marginal utility of consumption
 
-    '''
+    """
     if np.ndim(c) == 0:
         c = np.array([c])
     epsilon = 0.003
@@ -46,7 +68,7 @@ def marg_ut_cons(c, sigma):
 
 
 def marg_ut_labor(n, chi_n, p):
-    r'''
+    r"""
     Compute the marginal disutility of labor.
 
     .. math::
@@ -63,7 +85,7 @@ def marg_ut_labor(n, chi_n, p):
     Returns:
         output (array_like): marginal disutility of labor supply
 
-    '''
+    """
     nvec = n
     if np.ndim(nvec) == 0:
         nvec = np.array([nvec])
@@ -74,30 +96,58 @@ def marg_ut_labor(n, chi_n, p):
     nvec_uncstr = np.logical_and(~nvec_low, ~nvec_high)
     MDU_n = np.zeros(nvec.shape)
     MDU_n[nvec_uncstr] = (
-        (p.b_ellipse / p.ltilde) *
-        ((nvec[nvec_uncstr] / p.ltilde) ** (p.upsilon - 1)) *
-        ((1 - ((nvec[nvec_uncstr] / p.ltilde) ** p.upsilon)) **
-         ((1 - p.upsilon) / p.upsilon)))
-    b2 = (0.5 * p.b_ellipse * (p.ltilde ** (-p.upsilon)) * (p.upsilon - 1) *
-          (eps_low ** (p.upsilon - 2)) *
-          ((1 - ((eps_low / p.ltilde) ** p.upsilon)) **
-          ((1 - p.upsilon) / p.upsilon)) *
-          (1 + ((eps_low / p.ltilde) ** p.upsilon) *
-          ((1 - ((eps_low / p.ltilde) ** p.upsilon)) ** (-1))))
-    b1 = ((p.b_ellipse / p.ltilde) * ((eps_low / p.ltilde) **
-                                      (p.upsilon - 1)) *
-          ((1 - ((eps_low / p.ltilde) ** p.upsilon)) **
-          ((1 - p.upsilon) / p.upsilon)) - (2 * b2 * eps_low))
+        (p.b_ellipse / p.ltilde)
+        * ((nvec[nvec_uncstr] / p.ltilde) ** (p.upsilon - 1))
+        * (
+            (1 - ((nvec[nvec_uncstr] / p.ltilde) ** p.upsilon))
+            ** ((1 - p.upsilon) / p.upsilon)
+        )
+    )
+    b2 = (
+        0.5
+        * p.b_ellipse
+        * (p.ltilde ** (-p.upsilon))
+        * (p.upsilon - 1)
+        * (eps_low ** (p.upsilon - 2))
+        * (
+            (1 - ((eps_low / p.ltilde) ** p.upsilon))
+            ** ((1 - p.upsilon) / p.upsilon)
+        )
+        * (
+            1
+            + ((eps_low / p.ltilde) ** p.upsilon)
+            * ((1 - ((eps_low / p.ltilde) ** p.upsilon)) ** (-1))
+        )
+    )
+    b1 = (p.b_ellipse / p.ltilde) * (
+        (eps_low / p.ltilde) ** (p.upsilon - 1)
+    ) * (
+        (1 - ((eps_low / p.ltilde) ** p.upsilon))
+        ** ((1 - p.upsilon) / p.upsilon)
+    ) - (2 * b2 * eps_low)
     MDU_n[nvec_low] = 2 * b2 * nvec[nvec_low] + b1
-    d2 = (0.5 * p.b_ellipse * (p.ltilde ** (-p.upsilon)) * (p.upsilon - 1) *
-          (eps_high ** (p.upsilon - 2)) *
-          ((1 - ((eps_high / p.ltilde) ** p.upsilon)) **
-          ((1 - p.upsilon) / p.upsilon)) *
-          (1 + ((eps_high / p.ltilde) ** p.upsilon) *
-          ((1 - ((eps_high / p.ltilde) ** p.upsilon)) ** (-1))))
-    d1 = ((p.b_ellipse / p.ltilde) * ((eps_high / p.ltilde) **
-          (p.upsilon - 1)) * ((1 - ((eps_high / p.ltilde) ** p.upsilon)) **
-          ((1 - p.upsilon) / p.upsilon)) - (2 * d2 * eps_high))
+    d2 = (
+        0.5
+        * p.b_ellipse
+        * (p.ltilde ** (-p.upsilon))
+        * (p.upsilon - 1)
+        * (eps_high ** (p.upsilon - 2))
+        * (
+            (1 - ((eps_high / p.ltilde) ** p.upsilon))
+            ** ((1 - p.upsilon) / p.upsilon)
+        )
+        * (
+            1
+            + ((eps_high / p.ltilde) ** p.upsilon)
+            * ((1 - ((eps_high / p.ltilde) ** p.upsilon)) ** (-1))
+        )
+    )
+    d1 = (p.b_ellipse / p.ltilde) * (
+        (eps_high / p.ltilde) ** (p.upsilon - 1)
+    ) * (
+        (1 - ((eps_high / p.ltilde) ** p.upsilon))
+        ** ((1 - p.upsilon) / p.upsilon)
+    ) - (2 * d2 * eps_high)
     MDU_n[nvec_high] = 2 * d2 * nvec[nvec_high] + d1
     output = MDU_n * np.squeeze(chi_n)
     output = np.squeeze(output)
@@ -105,11 +155,12 @@ def marg_ut_labor(n, chi_n, p):
 
 
 def get_bq(BQ, j, p, method):
-    r'''
+    r"""
     Calculate bequests to each household.
 
     .. math::
-        bq_{j,s,t} = zeta_{j,s}\frac{BQ_{t}}{\lambda_{j}\omega_{s,t}}
+        \hat{bq}_{j,s,t} = \zeta_{j,s}
+        \frac{\hat{BQ}_{t}}{\lambda_{j}\hat{\omega}_{s,t}} \quad\forall j,s,t
 
     Args:
         BQ (array_like): aggregate bequests
@@ -121,52 +172,61 @@ def get_bq(BQ, j, p, method):
     Returns:
         bq (array_like): bequests received by each household
 
-    '''
+    """
     if p.use_zeta:
         if j is not None:
-            if method == 'SS':
-                bq = (p.zeta[:, j] * BQ) / (p.lambdas[j] * p.omega_SS)
+            if method == "SS":
+                bq = (p.zeta[:, j] * BQ) / p.omega_SS[:, j]
             else:
                 len_T = BQ.shape[0]
-                bq = ((np.reshape(p.zeta[:, j], (1, p.S)) *
-                      BQ.reshape((len_T, 1))) /
-                      (p.lambdas[j] * p.omega[:len_T, :]))
+                bq = (
+                    np.reshape(p.zeta[:, j], (1, p.S)) * BQ.reshape((len_T, 1))
+                ) / p.omega[:len_T, :, j]
         else:
-            if method == 'SS':
-                bq = ((p.zeta * BQ) / (p.lambdas.reshape((1, p.J)) *
-                                       p.omega_SS.reshape((p.S, 1))))
+            if method == "SS":
+                bq = (p.zeta * BQ) / p.omega_SS
             else:
                 len_T = BQ.shape[0]
-                bq = ((np.reshape(p.zeta, (1, p.S, p.J)) *
-                      utils.to_timepath_shape(BQ)) /
-                      (p.lambdas.reshape((1, 1, p.J)) *
-                       p.omega[:len_T, :].reshape((len_T, p.S, 1))))
+                bq = (
+                    np.reshape(p.zeta, (1, p.S, p.J))
+                    * utils.to_timepath_shape(BQ)
+                ) / p.omega[:len_T, :, :]
     else:
+        # Divide each group's bequest pool by its actual population share
+        # rather than its birth share (lambdas): with demographic gradients
+        # across income groups (PR #1165), survivorship differs by group and
+        # the two are no longer equal. With common demographics they
+        # coincide, so results are unchanged in that case.
         if j is not None:
-            if method == 'SS':
-                bq = np.tile(BQ[j], p.S) / p.lambdas[j]
-            if method == 'TPI':
+            if method == "SS":
+                pop_j = p.omega_SS[:, j].sum()
+                bq = np.tile(BQ[j], p.S) / pop_j
+            if method == "TPI":
                 len_T = BQ.shape[0]
-                bq = np.tile(np.reshape(BQ[:, j] / p.lambdas[j],
-                                        (len_T, 1)), (1, p.S))
+                pop_j = p.omega[:len_T, :, j].sum(axis=1)
+                bq = np.tile(
+                    np.reshape(BQ[:, j] / pop_j, (len_T, 1)), (1, p.S)
+                )
         else:
-            if method == 'SS':
-                BQ_per = BQ / np.squeeze(p.lambdas)
+            if method == "SS":
+                pop = p.omega_SS.sum(axis=0)
+                BQ_per = BQ / pop
                 bq = np.tile(np.reshape(BQ_per, (1, p.J)), (p.S, 1))
-            if method == 'TPI':
+            if method == "TPI":
                 len_T = BQ.shape[0]
-                BQ_per = BQ / p.lambdas.reshape(1, p.J)
-                bq = np.tile(np.reshape(BQ_per, (len_T, 1, p.J)),
-                             (1, p.S, 1))
+                pop = p.omega[:len_T, :, :].sum(axis=1)
+                BQ_per = BQ / pop
+                bq = np.tile(np.reshape(BQ_per, (len_T, 1, p.J)), (1, p.S, 1))
     return bq
 
 
 def get_tr(TR, j, p, method):
-    r'''
+    r"""
     Calculate transfers to each household.
 
     .. math::
-        tr_{j,s,t} = zeta_{j,s}\frac{TR_{t}}{\lambda_{j}\omega_{s,t}}
+        \hat{tr}_{j,s,t} = \zeta_{j,s}
+        \frac{\hat{TR}_{t}}{\lambda_{j}\hat{\omega}_{s,t}} \quad\forall j,s,t
 
     Args:
         TR (array_like): aggregate transfers
@@ -176,157 +236,427 @@ def get_tr(TR, j, p, method):
             'TPI'
 
     Returns:
-        tr (array_like): transfers received by each household
+        tr (array_like): transfers received by household
 
-    '''
+    """
     if j is not None:
-        if method == 'SS':
-            tr = (p.eta[-1, :, j] * TR) / (p.lambdas[j] * p.omega_SS)
+        if method == "SS":
+            tr = (p.eta[-1, :, j] * TR) / p.omega_SS[:, j]
         else:
             len_T = TR.shape[0]
-            tr = ((p.eta[:len_T, :, j] *
-                  TR.reshape((len_T, 1))) /
-                  (p.lambdas[j] * p.omega[:len_T, :]))
+            tr = (p.eta[:len_T, :, j] * TR.reshape((len_T, 1))) / (
+                p.omega[:len_T, :, j]
+            )
     else:
-        if method == 'SS':
-            tr = ((p.eta[-1, :, :] * TR) /
-                  (p.lambdas.reshape((1, p.J)) *
-                   p.omega_SS.reshape((p.S, 1))))
+        if method == "SS":
+            tr = (p.eta[-1, :, :] * TR) / p.omega_SS
         else:
             len_T = TR.shape[0]
-            tr = ((p.eta[:len_T, :, :] *
-                   utils.to_timepath_shape(TR)) /
-                  (p.lambdas.reshape((1, 1, p.J)) *
-                   p.omega[:len_T, :].reshape((len_T, p.S, 1))))
+            tr = (p.eta[:len_T, :, :] * utils.to_timepath_shape(TR)) / (
+                p.omega[:len_T, :, :]
+            )
 
     return tr
 
 
-def get_cons(r, w, b, b_splus1, n, bq, net_tax, e, tau_c, p):
-    r'''
-    Calculate household consumption.
+def get_rm(RM, j, p, method):
+    r"""
+    Calculate remittances to each household.
 
     .. math::
-        c_{j,s,t} =  \frac{(1 + r_{t})b_{j,s,t} + w_t e_{j,s} n_{j,s,t}
-        + bq_{j,s,t} + tr_{j,s,t} - T_{j,s,t} -
-        e^{g_y}b_{j,s+1,t+1}}{1 - \tau^{c}_{s,t}}
+        \hat{rm}_{j,s,t} = \eta_{RM,j,s,t}
+        \frac{\hat{RM}_{t}}{\lambda_{j}\hat{\omega}_{s,t}} \quad\forall j,s,t
 
     Args:
-        r (array_like): the real interest rate
+        RM (array_like): aggregate remittances
+        j (int): index of lifetime ability group
+        p (OG-Core Specifications object): model parameters
+        method (str): adjusts calculation dimensions based on 'SS' or
+            'TPI'
+
+    Returns:
+        rm (array_like): remittances received by household
+
+    """
+    if j is not None:
+        if method == "SS":
+            rm = (p.eta_RM[-1, :, j] * RM) / p.omega_SS[:, j]
+        else:
+            len_T = RM.shape[0]
+            rm = (p.eta_RM[:len_T, :, j] * RM.reshape((len_T, 1))) / (
+                p.omega[:len_T, :, j]
+            )
+    else:
+        if method == "SS":
+            rm = (p.eta_RM[-1, :, :] * RM) / p.omega_SS
+        else:
+            len_T = RM.shape[0]
+            rm = (p.eta_RM[:len_T, :, :] * utils.to_timepath_shape(RM)) / (
+                p.omega[:len_T, :, :]
+            )
+
+    return rm
+
+
+def get_cons(
+    r_p,
+    w,
+    p_tilde,
+    p_i,
+    b,
+    b_splus1,
+    n,
+    bq,
+    rm,
+    net_tax,
+    e,
+    tau_c,
+    p,
+    method="SS",
+):
+    r"""
+    Calculate household composite consumption.
+
+    .. math::
+        \hat{c}_{j,s,t} &= \biggl[(1 + r_{p,t})\hat{b}_{j,s,t}
+        + \hat{w}_t e_{j,s}n_{j,s,t} + \hat{bq}_{j,s,t} + \hat{rm}_{j,s,t}
+        + \hat{tr}_{j,s,t} + \hat{ubi}_{j,s,t} + \hat{pension}_{j,s,t}
+        - \hat{tax}_{j,s,t} \\
+        &\qquad - \sum_{i=1}^I\left(1 + \tau^c_{i,t}\right)
+        p_{i,t}\hat{c}_{min,i}
+        - e^{g_y}\hat{b}_{j,s+1,t+1}\biggr] / p_t \\
+        &\qquad\qquad\forall j,t \quad\text{and}\quad E+1\leq s\leq E+S
+        \quad\text{where}\quad \hat{b}_{j,E+1,t}=0
+
+    Args:
+        r_p (array_like): the real interest rate
         w (array_like): the real wage rate
+        p_tilde (array_like): the ratio of real GDP to nominal GDP
+        p_i (Numpy array): prices for consumption good i
         b (Numpy array): household savings
         b_splus1 (Numpy array): household savings one period ahead
         n (Numpy array): household labor supply
         bq (Numpy array): household bequests received
+        rm (Numpy array): household remittances received
         net_tax (Numpy array): household net taxes paid
         e (Numpy array): effective labor units
-        tau_c (array_like): consumption tax rates
+        tau_c (Numpy array): consumption tax rates
         p (OG-Core Specifications object): model parameters
+        method (str): adjusts calculation dimensions based on 'SS' or 'TPI'
 
     Returns:
         cons (Numpy array): household consumption
 
-    '''
-    cons = ((1 + r) * b + w * e * n + bq - b_splus1 * np.exp(p.g_y) -
-            net_tax) / (1 + tau_c)
+    """
+    if method == "SS":
+        min_cons_expenditure = np.sum((1 + tau_c) * p_i * p.c_min)
+    elif method == "TPI_scalar":
+        min_cons_expenditure = np.sum((1 + tau_c) * p_i * p.c_min)
+    else:  # TPI case
+        min_cons_expenditure = np.sum(
+            (1 + tau_c) * p_i * p.c_min.reshape((1, p.I)), axis=1
+        )
+        length = r_p.shape[0]
+        # reshape if needed for broadcasting
+        n_dims = np.ndim(bq)
+        if n_dims == 1:
+            min_cons_expenditure = min_cons_expenditure.reshape((length,))
+        elif n_dims == 2:
+            min_cons_expenditure = min_cons_expenditure.reshape((length, 1))
+        else:
+            min_cons_expenditure = min_cons_expenditure.reshape((length, 1, 1))
+
+    cons = (
+        (1 + r_p) * b
+        + w * e * n
+        + bq
+        + rm
+        - net_tax
+        - b_splus1 * np.exp(p.g_y)
+        - min_cons_expenditure
+    ) / p_tilde
+
     return cons
 
 
-def FOC_savings(r, w, b, b_splus1, n, bq, factor, tr, ubi, theta, e, rho,
-                tau_c, etr_params, mtry_params, t, j, p, method):
-    r'''
+def get_ci(c_s, p_i, p_tilde, tau_c, alpha_c, c_min, method="SS"):
+    r"""
+    Compute consumption of good i given amount of composite consumption
+    and prices.
+
+    .. math::
+        c_{i,j,s,t} = \frac{c_{s,j,t}}{\alpha_{i,j}p_{i,j}}
+
+    Args:
+        c_s (array_like): composite consumption
+        p_i (array_like): prices for consumption good i
+        p_tilde (array_like): composite good price
+        tau_c (array_like): consumption tax rate
+        alpha_c (array_like): consumption share parameters
+        c_min (array_like): minimum consumption levels for each good i
+        method (str): adjusts calculation dimensions based on 'SS' or 'TPI'
+
+    Returns:
+        c_si (array_like): consumption of good i
+    """
+    if method == "SS":
+        I = alpha_c.shape[0]  # noqa: E741
+        S = c_s.shape[0]
+        J = c_s.shape[1]
+        tau_c = tau_c.reshape(I, 1, 1)
+        alpha_c = alpha_c.reshape(I, 1, 1)
+        c_min = c_min.reshape(I, 1, 1)
+        p_tilde.reshape(1, 1, 1)
+        p_i = p_i.reshape(I, 1, 1)
+        c_s = c_s.reshape(1, S, J)
+        c_si = alpha_c * (((1 + tau_c) * p_i) / p_tilde) ** (-1) * c_s + c_min
+    else:  # Time path case
+        I = alpha_c.shape[0]  # noqa: E741
+        T = p_i.shape[0]
+        S = c_s.shape[1]
+        J = c_s.shape[2]
+        tau_c = tau_c.reshape(T, I, 1, 1)
+        alpha_c = alpha_c.reshape(1, I, 1, 1)
+        c_min = c_min.reshape(1, I, 1, 1)
+        p_tilde = p_tilde.reshape(T, 1, 1, 1)
+        p_i = p_i.reshape(T, I, 1, 1)
+        c_s = c_s.reshape(T, 1, S, J)
+        c_si = alpha_c * (((1 + tau_c) * p_i) / p_tilde) ** (-1) * c_s + c_min
+    return c_si
+
+
+def FOC_savings(
+    r,
+    w,
+    p_tilde,
+    p_i,
+    b,
+    b_splus1,
+    n,
+    bq,
+    rm,
+    factor,
+    tr,
+    ubi,
+    theta,
+    rho,
+    etr_params,
+    mtry_params,
+    t,
+    j,
+    p,
+    method,
+    ndc_rates=None,
+):
+    r"""
     Computes Euler errors for the FOC for savings in the steady state.
     This function is usually looped through over J, so it does one
     lifetime income group at a time.
 
     .. math::
-        c_{j,s,t}^{-\sigma} = e^{-\sigma g_y}
+        \frac{c_{j,s,t}^{-\sigma}}{\tilde{p}_{t}} = e^{-\sigma g_y}
         \biggl[\chi^b_j\rho_s(b_{j,s+1,t+1})^{-\sigma} +
-        \beta_j\bigl(1 - \rho_s\bigr)\Bigl(1 + r_{t+1}
-        \bigl[1 - \tau^{mtry}_{s+1,t+1}\bigr]\Bigr)
+        \beta_j\bigl(1 - \rho_s\bigr)\Bigl(\frac{1 + r_{t+1}
+        \bigl[1 - \tau^{mtry}_{s+1,t+1}\bigr]}{\tilde{p}_{t+1}}\Bigr)
         (c_{j,s+1,t+1})^{-\sigma}\biggr]
 
     Args:
         r (array_like): the real interest rate
         w (array_like): the real wage rate
+        p_tilde (array_like): composite good price
+        p_i (Numpy array): prices for consumption good i
         b (Numpy array): household savings
         b_splus1 (Numpy array): household savings one period ahead
         b_splus2 (Numpy array): household savings two periods ahead
         n (Numpy array): household labor supply
         bq (Numpy array): household bequests received
+        rm (Numpy array): household remittances received
         factor (scalar): scaling factor converting model units to dollars
         tr (Numpy array): government transfers to household
         ubi (Numpy array): universal basic income payment
         theta (Numpy array): social security replacement rate for each
             lifetime income group
-        e (Numpy array): effective labor units
         rho (Numpy array): mortality rates
-        tau_c (array_like): consumption tax rates
-        etr_params (Numpy array): parameters of the effective tax rate
+        etr_params (list): parameters of the effective tax rate
             functions
-        mtry_params (Numpy array): parameters of the marginal tax rate
+        mtry_params (list): parameters of the marginal tax rate
             on capital income functions
         t (int): model period
         j (int): index of ability type
         p (OG-Core Specifications object): model parameters
         method (str): adjusts calculation dimensions based on 'SS' or
             'TPI'
+        ndc_rates (NDCRates): calendar paths of the NDC credited and
+            discount rates (``pensions.ndc_rates_path``); None for the
+            steady-state rates
 
     Returns:
         euler (Numpy array): Euler error from FOC for savings
 
-    '''
+    """
     if j is not None:
         chi_b = p.chi_b[j]
         beta = p.beta[j]
+        if method == "SS":
+            tax_noncompliance = p.capital_income_tax_noncompliance_rate[-1, j]
+            income_tax_filer = p.income_tax_filer[-1, j]
+            wealth_tax_filer = p.wealth_tax_filer[-1, j]
+            e = np.squeeze(p.e[-1, :, j])
+        elif method == "TPI_scalar":
+            tax_noncompliance = p.capital_income_tax_noncompliance_rate[0, j]
+            income_tax_filer = p.income_tax_filer[0, j]
+            wealth_tax_filer = p.wealth_tax_filer[0, j]
+            e = np.squeeze(p.e[0, :, j])
+        else:
+            length = r.shape[0]
+            tax_noncompliance = p.capital_income_tax_noncompliance_rate[
+                t : t + length, j
+            ]
+            income_tax_filer = p.income_tax_filer[t : t + length, j]
+            wealth_tax_filer = p.wealth_tax_filer[t : t + length, j]
+            e_long = _get_e_long(p)
+            e = np.diag(e_long[t : t + p.S, :, j], max(p.S - length, 0))
     else:
         chi_b = p.chi_b
         beta = p.beta
-    if method == 'SS':
+        if method == "SS":
+            tax_noncompliance = p.capital_income_tax_noncompliance_rate[-1, :]
+            income_tax_filer = p.income_tax_filer[-1, :]
+            wealth_tax_filer = p.wealth_tax_filer[-1, :]
+            e = np.squeeze(p.e[-1, :, :])
+        elif method == "TPI_scalar":
+            tax_noncompliance = p.capital_income_tax_noncompliance_rate[0, :]
+            income_tax_filer = p.income_tax_filer[0, :]
+            wealth_tax_filer = p.wealth_tax_filer[0, :]
+            e = np.squeeze(p.e[0, :, :])
+        else:
+            length = r.shape[0]
+            tax_noncompliance = p.capital_income_tax_noncompliance_rate[
+                t : t + length, :
+            ]
+            income_tax_filer = p.income_tax_filer[t : t + length, :]
+            wealth_tax_filer = p.wealth_tax_filer[t : t + length, :]
+            e_long = _get_e_long(p)
+            e = np.diag(e_long[t : t + p.S, :, :], max(p.S - length, 0))
+    e = np.squeeze(e)
+    if method == "SS":
         h_wealth = p.h_wealth[-1]
         m_wealth = p.m_wealth[-1]
         p_wealth = p.p_wealth[-1]
+        p_tilde = np.ones_like(rho) * p_tilde
+        tau_c = p.tau_c[-1, :]
+    elif method == "TPI_scalar":
+        h_wealth = p.h_wealth[0]
+        m_wealth = p.m_wealth[0]
+        p_wealth = p.p_wealth[0]
+        tau_c = p.tau_c[0, :]
     else:
-        h_wealth = p.h_wealth[t]
-        m_wealth = p.m_wealth[t]
-        p_wealth = p.p_wealth[t]
-
-    taxes = tax.net_taxes(r, w, b, n, bq, factor, tr, ubi, theta, t, j,
-                          False, method, e, etr_params, p)
-    cons = get_cons(r, w, b, b_splus1, n, bq, taxes, e, tau_c, p)
-    deriv = ((1 + r) - (
-        r * tax.MTR_income(r, w, b, n, factor, True, e, etr_params,
-                           mtry_params, p)) -
-             tax.MTR_wealth(b, h_wealth, m_wealth, p_wealth))
-    savings_ut = (rho * np.exp(-p.sigma * p.g_y) * chi_b *
-                  b_splus1 ** (-p.sigma))
+        h_wealth = p.h_wealth[t : t + length]
+        m_wealth = p.m_wealth[t : t + length]
+        p_wealth = p.p_wealth[t : t + length]
+        tau_c = p.tau_c[t : t + length, :]
+    taxes = tax.net_taxes(
+        r,
+        w,
+        b,
+        n,
+        bq,
+        factor,
+        tr,
+        ubi,
+        theta,
+        t,
+        j,
+        False,
+        method,
+        e,
+        etr_params,
+        p,
+        ndc_rates,
+    )
+    cons = get_cons(
+        r, w, p_tilde, p_i, b, b_splus1, n, bq, rm, taxes, e, tau_c, p, method
+    )
+    deriv = (
+        (1 + r)
+        - (
+            r
+            * tax.MTR_income(
+                r,
+                w,
+                b,
+                n,
+                factor,
+                True,
+                e,
+                etr_params,
+                mtry_params,
+                tax_noncompliance,
+                income_tax_filer,
+                p,
+            )
+        )
+        - tax.MTR_wealth(b, h_wealth, m_wealth, p_wealth, wealth_tax_filer)
+    )
+    savings_ut = (
+        rho * np.exp(-p.sigma * p.g_y) * chi_b * b_splus1 ** (-p.sigma)
+    )
     euler_error = np.zeros_like(n)
     if n.shape[0] > 1:
-        euler_error[:-1] = (marg_ut_cons(cons[:-1], p.sigma) *
-                            (1 / (1 + tau_c[:-1])) - beta *
-                            (1 - rho[:-1]) * deriv[1:] *
-                            marg_ut_cons(cons[1:], p.sigma) *
-                            (1 / (1 + tau_c[1:])) * np.exp(-p.sigma * p.g_y)
-                            - savings_ut[:-1])
-        euler_error[-1] = (marg_ut_cons(cons[-1], p.sigma) *
-                           (1 / (1 + tau_c[-1])) - savings_ut[-1])
+        euler_error[:-1] = (
+            marg_ut_cons(cons[:-1], p.sigma) * (1 / p_tilde[:-1])
+            - beta
+            * (1 - rho[:-1])
+            * deriv[1:]
+            * marg_ut_cons(cons[1:], p.sigma)
+            * (1 / p_tilde[1:])
+            * np.exp(-p.sigma * p.g_y)
+            - savings_ut[:-1]
+        )
+        euler_error[-1] = (
+            marg_ut_cons(cons[-1], p.sigma) * (1 / p_tilde[-1])
+            - savings_ut[-1]
+        )
     else:
-        euler_error[-1] = (marg_ut_cons(cons[-1], p.sigma) *
-                           (1 / (1 + tau_c[-1])) - savings_ut[-1])
+        euler_error[-1] = (
+            marg_ut_cons(cons[-1], p.sigma) * (1 / p_tilde[-1])
+            - savings_ut[-1]
+        )
 
     return euler_error
 
 
-def FOC_labor(r, w, b, b_splus1, n, bq, factor, tr, ubi, theta, chi_n, e,
-              tau_c, etr_params, mtrx_params, t, j, p, method):
-    r'''
+def FOC_labor(
+    r,
+    w,
+    p_tilde,
+    p_i,
+    b,
+    b_splus1,
+    n,
+    bq,
+    rm,
+    factor,
+    tr,
+    ubi,
+    theta,
+    chi_n,
+    etr_params,
+    mtrx_params,
+    t,
+    j,
+    p,
+    method,
+    ndc_rates=None,
+):
+    r"""
     Computes errors for the FOC for labor supply in the steady
     state.  This function is usually looped through over J, so it does
     one lifetime income group at a time.
 
     .. math::
         w_t e_{j,s}\bigl(1 - \tau^{mtrx}_{s,t}\bigr)
-        (c_{j,s,t})^{-\sigma} = \chi^n_{s}
+       \frac{(c_{j,s,t})^{-\sigma}}{ \tilde{p}_{t}} = \chi^n_{s}
         \biggl(\frac{b}{\tilde{l}}\biggr)\biggl(\frac{n_{j,s,t}}
         {\tilde{l}}\biggr)^{\upsilon-1}\Biggl[1 -
         \biggl(\frac{n_{j,s,t}}{\tilde{l}}\biggr)^\upsilon\Biggr]
@@ -335,10 +665,13 @@ def FOC_labor(r, w, b, b_splus1, n, bq, factor, tr, ubi, theta, chi_n, e,
     Args:
         r (array_like): the real interest rate
         w (array_like): the real wage rate
+        p_tilde (array_like): composite good price
+        p_i (Numpy array): prices for consumption good i
         b (Numpy array): household savings
         b_splus1 (Numpy array): household savings one period ahead
         n (Numpy array): household labor supply
         bq (Numpy array): household bequests received
+        rm (Numpy array): household bequests received
         factor (scalar): scaling factor converting model units to dollars
         tr (Numpy array): government transfers to household
         ubi (Numpy array): universal basic income payment
@@ -347,51 +680,126 @@ def FOC_labor(r, w, b, b_splus1, n, bq, factor, tr, ubi, theta, chi_n, e,
         chi_n (Numpy array): utility weight on the disutility of labor
             supply
         e (Numpy array): effective labor units
-        tau_c (array_like): consumption tax rates
-        etr_params (Numpy array): parameters of the effective tax rate
+        etr_params (list): parameters of the effective tax rate
             functions
-        mtrx_params (Numpy array): parameters of the marginal tax rate
+        mtrx_params (list): parameters of the marginal tax rate
             on labor income functions
         t (int): model period
         j (int): index of ability type
         p (OG-Core Specifications object): model parameters
         method (str): adjusts calculation dimensions based on 'SS' or
             'TPI'
+        ndc_rates (NDCRates): calendar paths of the NDC credited and
+            discount rates (``pensions.ndc_rates_path``); None for the
+            steady-state rates
 
     Returns:
         FOC_error (Numpy array): error from FOC for labor supply
 
-    '''
-    if method == 'SS':
-        tau_payroll = p.tau_payroll[-1]
-    elif method == 'TPI_scalar':  # for 1st donut ring only
-        tau_payroll = p.tau_payroll[0]
+    """
+    if method == "SS":
+        tau_c = p.tau_c[-1, :]
+    elif method == "TPI_scalar":  # for 1st donut ring only
+        tau_c = p.tau_c[0, :]
     else:
         length = r.shape[0]
-        tau_payroll = p.tau_payroll[t:t + length]
-    if method == 'TPI':
+        tau_c = p.tau_c[t : t + length, :]
+    if j is not None:
+        if method == "SS":
+            tax_noncompliance = p.labor_income_tax_noncompliance_rate[-1, j]
+            income_tax_filer = p.income_tax_filer[-1, j]
+            tau_payroll = p.tau_payroll[-1, j]
+            e = np.squeeze(p.e[-1, :, j])
+        elif method == "TPI_scalar":
+            tax_noncompliance = p.labor_income_tax_noncompliance_rate[0, j]
+            income_tax_filer = p.income_tax_filer[0, j]
+            tau_payroll = p.tau_payroll[0, j]
+            e = np.squeeze(p.e[0, -1, j])
+        else:
+            tax_noncompliance = p.labor_income_tax_noncompliance_rate[
+                t : t + length, j
+            ]
+            income_tax_filer = p.income_tax_filer[t : t + length, j]
+            tau_payroll = p.tau_payroll[t : t + length, j]
+            e_long = _get_e_long(p)
+            e = np.diag(e_long[t : t + p.S, :, j], max(p.S - length, 0))
+    else:
+        if method == "SS":
+            tax_noncompliance = p.labor_income_tax_noncompliance_rate[-1, :]
+            income_tax_filer = p.income_tax_filer[-1, :]
+            tau_payroll = p.tau_payroll[-1, :]
+            e = np.squeeze(p.e[-1, :, :])
+        elif method == "TPI_scalar":
+            tax_noncompliance = p.labor_income_tax_noncompliance_rate[0, :]
+            income_tax_filer = p.income_tax_filer[0, :]
+            tau_payroll = p.tau_payroll[0, :]
+            e = np.squeeze(p.e[0, -1, :])
+        else:
+            tax_noncompliance = p.labor_income_tax_noncompliance_rate[
+                t : t + length, :
+            ]
+            income_tax_filer = p.income_tax_filer[t : t + length, :]
+            tau_payroll = p.tau_payroll[t : t + length, :]
+            e_long = _get_e_long(p)
+            e = np.diag(e_long[t : t + p.S, :, j], max(p.S - length, 0))
+    if method == "TPI":
         if b.ndim == 2:
             r = r.reshape(r.shape[0], 1)
             w = w.reshape(w.shape[0], 1)
             tau_payroll = tau_payroll.reshape(tau_payroll.shape[0], 1)
 
-    taxes = tax.net_taxes(r, w, b, n, bq, factor, tr, ubi, theta, t, j,
-                          False, method, e, etr_params, p)
-    cons = get_cons(r, w, b, b_splus1, n, bq, taxes, e, tau_c, p)
-    deriv = (1 - tau_payroll -
-             tax.MTR_income(r, w, b, n, factor, False, e, etr_params,
-                            mtrx_params, p))
-    FOC_error = (marg_ut_cons(cons, p.sigma) * (1 / (1 + tau_c)) * w *
-                 deriv * e - marg_ut_labor(n, chi_n, p))
+    taxes = tax.net_taxes(
+        r,
+        w,
+        b,
+        n,
+        bq,
+        factor,
+        tr,
+        ubi,
+        theta,
+        t,
+        j,
+        False,
+        method,
+        e,
+        etr_params,
+        p,
+        ndc_rates,
+    )
+    cons = get_cons(
+        r, w, p_tilde, p_i, b, b_splus1, n, bq, rm, taxes, e, tau_c, p, method
+    )
+    deriv = (
+        1
+        - tau_payroll
+        - tax.MTR_income(
+            r,
+            w,
+            b,
+            n,
+            factor,
+            False,
+            e,
+            etr_params,
+            mtrx_params,
+            tax_noncompliance,
+            income_tax_filer,
+            p,
+        )
+    )
+    FOC_error = marg_ut_cons(cons, p.sigma) * (
+        1 / p_tilde
+    ) * w * deriv * e - marg_ut_labor(n, chi_n, p)
 
     return FOC_error
 
 
-def get_y(r_p, w, b_s, n, p):
-    '''
+def get_y(r_p, w, b_s, n, p, method):
+    r"""
     Compute household income before taxes.
 
-    ..math::
+    .. math::
         y_{j,s,t} = r_{p,t}b_{j,s,t} + w_{t}e_{j,s}n_{j,s,t}
 
     Args:
@@ -400,15 +808,23 @@ def get_y(r_p, w, b_s, n, p):
         b_s (Numpy array): household savings coming into the period
         n (Numpy array): household labor supply
         p (OG-Core Specifications object): model parameters
-    '''
-
-    y = r_p * b_s + w * p.e * n
+        method (str): adjusts calculation dimensions based on 'SS' or 'TPI'
+    """
+    if method == "SS":
+        # NOTE: do not np.squeeze here -- for J=1 it collapses p.e[-1, :, :]
+        # from (S, 1) to (S,), which then broadcasts against the (S, 1) b_s/n
+        # into an (S, S) outer product, giving wrong before-tax income. The
+        # array is already (S, J).
+        e = p.e[-1, :, :]
+    elif method == "TPI":
+        e = p.e
+    y = r_p * b_s + w * e * n
 
     return y
 
 
 def constraint_checker_SS(bssmat, nssmat, cssmat, ltilde):
-    '''
+    """
     Checks constraints on consumption, savings, and labor supply in the
     steady state.
 
@@ -424,32 +840,34 @@ def constraint_checker_SS(bssmat, nssmat, cssmat, ltilde):
     Raises:
         Warnings: if constraints are violated, warnings printed
 
-    '''
-    print('Checking constraints on capital, labor, and consumption.')
+    """
+    logger.info("Checking constraints on capital, labor, and consumption.")
 
     if (bssmat < 0).any():
-        print('\tWARNING: There is negative capital stock')
+        logger.info("WARNING: There is negative capital stock")
     flag2 = False
     if (nssmat < 0).any():
-        print('\tWARNING: Labor supply violates nonnegativity ',
-              'constraints.')
+        logger.info(
+            "WARNING: Labor supply violates nonnegativity constraints."
+        )
         flag2 = True
     if (nssmat > ltilde).any():
-        print('\tWARNING: Labor supply violates the ltilde constraint.')
+        logger.info("WARNING: Labor supply violates the ltilde constraint.")
         flag2 = True
     if flag2 is False:
-        print('\tThere were no violations of the constraints on labor',
-              ' supply.')
+        logger.info(
+            "There were no violations of the constraints on labor supply.",
+        )
     if (cssmat < 0).any():
-        print('\tWARNING: Consumption violates nonnegativity',
-              ' constraints.')
+        logger.info("WARNING: Consumption violates nonnegativity constraints.")
     else:
-        print('\tThere were no violations of the constraints on',
-              ' consumption.')
+        logger.info(
+            "There were no violations of the constraints on consumption."
+        )
 
 
 def constraint_checker_TPI(b_dist, n_dist, c_dist, t, ltilde):
-    '''
+    """
     Checks constraints on consumption, savings, and labor supply along
     the transition path. Does this for each period t separately.
 
@@ -466,16 +884,24 @@ def constraint_checker_TPI(b_dist, n_dist, c_dist, t, ltilde):
     Raises:
         Warnings: if constraints are violated, warnings printed
 
-    '''
+    """
     if (b_dist <= 0).any():
-        print('\tWARNING: Aggregate capital is less than or equal to ',
-              'zero in period %.f.' % t)
+        logger.info(
+            "WARNING: Aggregate capital is less than or equal to"
+            f" zero in period {t}."
+        )
     if (n_dist < 0).any():
-        print('\tWARNING: Labor supply violates nonnegativity',
-              ' constraints in period %.f.' % t)
+        logger.info(
+            "WARNING: Labor supply violates nonnegativity"
+            f" constraints in period {t}."
+        )
     if (n_dist > ltilde).any():
-        print('\tWARNING: Labor suppy violates the ltilde constraint',
-              ' in period %.f.' % t)
+        logger.info(
+            "\tWARNING: Labor suppy violates the ltilde constraint"
+            f" in period {t}."
+        )
     if (c_dist < 0).any():
-        print('\tWARNING: Consumption violates nonnegativity',
-              ' constraints in period %.f.' % t)
+        logger.info(
+            "\tWARNING: Consumption violates nonnegativity"
+            f" constraints in period {t}."
+        )

@@ -1,0 +1,968 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.24.4] - 2026-11-07
+
+### Adds
+- Adds a hybrid defined benefit and notional defined contribution pension system, selected with `pension_system = "Hybrid DB-NDC"`. Labor income up to `factor1_db_ndc_hybrid` times the wage is subject to `tau_payroll` and earns a defined benefit, computed with the `Defined Benefits` formula and parameters on that capped income. Labor income between `factor1_db_ndc_hybrid` and `factor2_db_ndc_hybrid` times the wage is subject to `tau_p` and earns a notional defined contribution benefit, computed with the `Notional Defined Contribution` formula and parameters (including the time-varying credited and discount rates), in addition to the defined benefit. Labor income above `factor2_db_ndc_hybrid` times the wage earns no benefit. As in the other systems, the benefit is scaled by `replacement_rate_adjust`.
+- Adds the parameters `factor1_db_ndc_hybrid` (default `[1.0]`) and `factor2_db_ndc_hybrid` (default `[2.0]`) and allows them to be time dependent, the cutoffs of the two earnings bands as multiples of the wage. Both are time varying, like `alpha_T`: each is a list of values by year, extended to a length T + S path, and the two lists may have different lengths. The cutoffs that apply to any labor income are those of the period in which it was earned. `Specifications` raises an error if `factor2_db_ndc_hybrid` is below `factor1_db_ndc_hybrid` in any period when the hybrid system is selected.
+- Adds `pensions.DB_NDC_hybrid_amount`, which computes the hybrid benefit for every shape the other systems accept (the steady state, a full or partial household lifetime, a cross section, and the full time path).
+- Adds `pensions.earnings_band` and `pensions.earnings_band_at`, which return the part of effective labor earnings between two cutoffs (fixed, or read from calendar paths in the period of earning).
+- Adds a section on the hybrid system to the pensions chapter of the documentation, and adds the new functions to the API documentation.
+- Adds tests of the hybrid benefit (against the DB and NDC benefits computed by hand, the pure DB and pure NDC limits, and time-varying cutoffs along a cohort's lifetime and across the time path) and a steady-state solution with the hybrid system.
+
+### Updates
+- `pensions.DB_amount` and `pensions.NDC_amount` take optional `earn_lo` and `earn_hi` arguments (a value or a path by period) that restrict the labor income entering the benefit to that band. They default to None, which leaves the Defined Benefits and Notional Defined Contribution systems unchanged.
+- `pensions.DB_1dim_loop`, `DB_2dim_loop`, `DB_3dim_loop`, `NDC_1dim_loop`, `NDC_2dim_loop`, and `NDC_3dim_loop` take optional `earn_lo` and `earn_hi` calendar paths, and `DB_1dim_loop` and `DB_2dim_loop` take the household's birth period (`t_birth`) or the cross section's period (`t_cross`), used to read the cutoffs in the period of each earning. All new arguments have defaults, so existing calls are unchanged.
+- `TPI.run_TPI` builds the NDC credited and discount rate paths for the hybrid system as well as for the `Notional Defined Contribution` system.
+- Bumps actions/setup-node from 4 to 7 in GH Actions (see PR #1275)
+
+## [0.24.3] - 2026-11-06
+
+### Changed
+- `pensions.pension_periods` now caches its result on the parameters object and recomputes it only when `S`, `T`, `avg_earn_num_years`, `yr_contrib`, or `retire` is reassigned. Changing elements of those arrays in place is not detected. The arrays it returns are read-only.
+- While solving the steady state, the replacement rate `theta` is now computed only under `'US-Style Social Security'`, the one system that uses it. The other systems use zeros through the new helper `SS.theta_in_solve`. `SS_solver` still computes `theta` at the solution for every system, so the saved steady-state output is unchanged.
+
+## [0.24.2] - 2026-11-05
+
+### Added
+- NDC balances now compound at the rates credited in each period of the cohort's own history, rather than at a single rate. The rates come from a calendar path built each transition path iteration by `pensions.ndc_rates_path` from the interest rate, GDP, wage, and labor paths, and reach the household problem through the new `ndc_rates` argument (an `NDCRates` named tuple of `credit` and `discount` paths) of `tax.net_taxes`, `household.FOC_savings`, `household.FOC_labor`, `TPI.firstdoughnutring`, `TPI.twist_doughnut`, and `aggregates.revenue`, and as an optional ninth element of the `TPI.inner_loop` `outer_loop_vars` tuple. In the steady state, or when `ndc_rates` is None, the steady-state rates are used.
+- Adds the growth-rate options `'wage bill'` (growth of total real labor earnings) and `'avg wage'` (growth of real labor earnings per person) to `ndc_growth_rate` and `dir_growth_rate`.
+- Adds the parameter `ndc_growth_avg_years` (default 1), the number of years over which the credited NDC rate is averaged (e.g., Italy's 5-year average of GDP growth).
+- Adds `pensions.growth_rate_path`, `pensions.ndc_rates_path`, and `pensions.NDCRates`.
+
+### Fixed
+- The `'Curr GDP'` options of `ndc_growth_rate` and `dir_growth_rate` now work. They returned an array where a scalar was expected, which raised errors in the benefit and conversion coefficient calculations, and the household problem received a placeholder of 1 for GDP. The rate is now real GDP growth recovered from stationarized GDP with productivity and population growth, `Y[t] / Y[t-1] * exp(g_y) * (1 + g_n[t-1]) - 1`, credited in period t.
+- The `'LR GDP'` rate is now the exact long-run growth rate of real GDP, `exp(g_y) * (1 + g_n_ss) - 1`, rather than the approximation `g_y + g_n`, and uses the steady-state population growth rate `g_n_ss` rather than the last element of `g_n`. This slightly changes NDC benefits under the default parameters.
+- On the transition path, the NDC conversion coefficient discounts payments at the `dir_growth_rate` in the household's period of retirement, held fixed over its retirement, rather than at the last element of the interest rate path passed in (for `'r'`).
+- Breaking signature changes: the fourth argument of `pensions.pension_amount` and the fifth of `pensions.NDC_amount` are now `ndc_rates` (previously an unused GDP argument `Y`); `pensions.g_dir` takes `(r, Y, p)`; `pensions.NDC_1dim_loop` and `pensions.NDC_2dim_loop` take the credited-rate path and the household's birth period (or the cross-section's period); `pensions.NDC_3dim_loop` takes the credited-rate path; `pensions.delta_ret` takes an optional `g_dir_path`.
+
+## [0.24.1] - 2026-11-04
+
+### Added
+- Adds the parameter `ndc_mortality` (default `'cohort'`), which sets the mortality rates in the annuity factor of the NDC conversion coefficient: the rates the retiring cohort faces at each age after retirement (`'cohort'`), the rates by age in the period of retirement (`'period'`), or the steady-state rates for every cohort (`'steady state'`, the previous behavior). The three coincide in the steady state. `pensions.delta_ret` takes the period of retirement as a new `t_ret` argument, and `NDC_amount` passes it from each household's own lifetime in every branch (Issue #1268).
+- Adds `pensions.annuity_mort_rates`, the (T + S) x S mortality rates used to annuitize NDC balances (`rho` averaged over lifetime income groups with `lambdas`, or a hand-set `mort_rates_SS`).
+
+### Fixed
+- Corrects the calculation of initial wealth when using the `initial_hhwealth_dist` and `initial_wealth_ratio` parameters. The initial aggregate household wealth now correctly accounts for the population weights.
+- Corrects the survival timing in the NDC annuity factor (`pensions.delta_ret_loop`). The payment at retirement age R is now certain and the payment at age R + k is weighted by the probability of surviving ages R through R + k - 1, consistent with the household mortality convention. Previously the mortality rate at age R was skipped, each later payment was weighted with survival one age too far, and the last payment received zero weight, which made the conversion coefficient, and so NDC benefits, too large (Issue #1268). The formula in the documentation is corrected to match.
+- Breaking signature change: `pensions.delta_ret_loop` no longer takes the `dir_delta_s` work array and no longer modifies the survival rates it is given.
+
+## [0.24.0] - 2026-10-31
+
+### Added
+- Adds the parameter `alpha_bs_FA` (default 1.0, time varying), the proportional adjustment to foreign aid relative to its baseline level when `baseline_spending=True`, analogous to `alpha_bs_G`, `alpha_bs_T`, and `alpha_bs_I`.
+- Adds `fiscal.get_foreign_aid`, which returns `alpha_FA * Y`, or `alpha_bs_FA` times the baseline level of foreign aid when `baseline_spending=True`. This replaces the separate `alpha_FA * Y` calculations in `D_G_path`, `get_G_ss`, `get_TR`, and the steady-state and transition path resource constraints.
+- The steady-state and transition path output dictionaries now include `foreign_aid`.
+- Adds `utils.get_baseline_foreign_aid`, which reads foreign aid from saved baseline output and, for baseline output saved before this change, reconstructs it as `alpha_FA` times baseline GDP (with a warning).
+
+### Updated
+- When `baseline_spending=True`, foreign aid in the reform is now held at its level in the baseline equilibrium (scaled by `alpha_bs_FA`) in both the steady state and the transition path, as is already done for transfers and infrastructure investment. Previously it was `alpha_FA` times reform GDP, so it changed with GDP. Changes to `alpha_FA` in the reform now have no effect when `baseline_spending=True`.
+- `alpha_bs_I` is now applied on the transition path when `baseline_spending=True`. Previously `run_TPI` used the unscaled baseline path of infrastructure investment, so `alpha_bs_I` affected only the steady state.
+- The titles and descriptions of `alpha_bs_T`, `alpha_bs_G`, and `alpha_bs_I` now say they apply when `baseline_spending` is True (they previously said "when budget balance is true").
+- The resource constraint check inside `SS.inner_loop` now uses `aggregates.resource_constraint` and includes remittances and foreign aid.
+- Breaking signature changes: `fiscal.get_G_ss` and `fiscal.get_TR` take a `foreign_aid` argument; the `dg_fixed_values` tuple passed to `fiscal.D_G_path` includes `foreign_aid` after `I_g`; `SS.SS_solver`, the `SS.inner_loop` `outer_loop_vars` tuple, and the `SS.SS_fsolve` args take `FA_baseline` after `Ig_baseline`; and the `baseline_values` tuple returned by `TPI.get_initial_SS_values` includes `FAbaseline` after `Ig_baseline`.
+
+## [0.23.1] - 2026-10-30
+
+### Updated
+- Adds support for Python 3.15 in the `pyproject.toml` classifiers and the GitHub Actions build matrix.
+- Makes pyGAM optional through the `pygam` extra on Python 3.12--3.14. Base installations and the Eilers smoother no longer import pyGAM; Python 3.15 uses SciPy 1.18.1 or newer, which provides compatible wheels.
+
+## [0.23.0] - 2026-10-29
+
+### Added
+- Adds `pension_regimes`, a list of pension reforms entered through `Specifications.update_specifications` (as a list in a dict or a JSON string; it is kept outside the ParamTools validation). Each regime is a dict with a calendar `year` from which it applies, an optional `max_age_at_start` (the oldest age, in that calendar year, to which the regime applies; omitted means everyone, cohorts not yet born always qualify), and the new values of the parameters it sets: `retirement_age`, the defined benefit parameters `alpha_db` (a number or one value per lifetime income group), `avg_earn_num_years`, and `yr_contrib`, and the notional defined contribution parameters `tau_p`, `k_ret`, and `indR`. Regimes apply in list order and a regime that leaves a parameter out leaves it unchanged, so a phased-in increase in the retirement age that exempts those near retirement is a short list rather than a `(T+S) x S` array. `Specifications._build_cohort_pension_arrays` expands each base value and the regimes into an array by period and age holding every cohort's own value (`retire` for the retirement period; `alpha_db` becomes `(T+S) x S x J`; `avg_earn_num_years`, `yr_contrib`, `tau_p`, `k_ret`, and `indR` become `(T+S) x S`), reading the base values from the ParamTools data so that a later `update_specifications` rebuilds them rather than layering regimes on already expanded arrays. `_check_retire_schedule` rejects a regime that would raise a cohort's retirement age after it has retired, and `_check_pension_steady_state` rejects one that leaves the final period with more than one value of any of these parameters.
+- The defined benefit and notional defined contribution formulas now read each household's own cohort parameters. `pensions.cohort_array` returns a pension parameter by period and age (broadcasting a single value), `pensions.cohort_path` extracts one household's lifetime path down the diagonal, and `pensions.pension_periods` returns the averaging window, credited contribution periods, and retirement period as `(T+S) x S` arrays. The DB loops take the retirement period, averaging window, credited periods, and replacement rate at each age, and the NDC loops take the retirement period and conversion coefficient at each age and the contribution rate at each working age, so a regime that changes the DB or NDC formula only for cohorts at or below a cutoff age leaves the benefits of those already retired unchanged. `pensions.delta_ret` takes optional arrays of retirement periods, `indR`, and `k_ret` and returns the conversion coefficient cell by cell.
+- Adds `pensions.NDC_3dim_loop`, the full-time-path `(T, S, J)` branch of `NDC_amount` (the counterpart of `DB_3dim_loop`), which builds each retiree's notional account from their own cohort's wage, labor, and contribution-rate history. The NDC system previously had no time-path branch, so `NDC_amount` failed on the `(T, S, J)` labor supply array that the aggregates pass.
+- Adds `pensions.retirement_mask`, which returns the boolean "at or past retirement" array for the steady state, the oldest household in period 0, a single cohort's remaining lifetime (the diagonal of `retire`, the same extraction the household problem uses for `chi_n` and `rho`), and the `(T, S)` and `(T, S, J)` cross sections.
+
+### Updated
+- `dask` scheduler for tax function estimation is now platform specific: `processes` on Linux and macOS, `threads` on Windows.
+- Tax function estimation of age-specific tax functions uses a warm-start in the estimation, so the first age's parameters are used as the initial guess for the next age. This speeds up the estimation and reduces the number of iterations needed to converge, especially when the tax functions are similar across ages.
+
+## [0.22.0] - 2026-10-27
+
+### Added
+- Adds two optional parameters for the initial distribution of household wealth on the transition path, `initial_hhwealth_dist` (an `S x J` matrix of shares of aggregate wealth, summing to one, that sets the shape of the initial distribution) and `initial_wealth_ratio` (the target ratio of initial aggregate household wealth to initial GDP, which sets its level). Both default to null, in which case `TPI` starts from the steady-state distribution of savings as before: `get_initial_SS_values` uses `initial_hhwealth_dist` for the shape only when it is not `None`, and `run_TPI` updates `B[0]` toward `initial_wealth_ratio * Y[0]` in each outer-loop iteration (rescaling the initial savings and refreshing `initial_values` for the inner loop) only when the ratio is not `None`. A reform run with either parameter set starts from the first-period wealth of the baseline transition path. `Specifications.compute_default_params` normalizes a null or cleared value of either parameter to `None` and checks the shape and sum of a supplied distribution. Documented in the calibration chapter (`SecCalibOther_InitW`) and the parameters list, with a test of `run_TPI` with both parameters set.
+- Adds `TPI._retry_root_if_failed`, which re-solves a household problem with the Levenberg-Marquardt method whenever the root finder selected by `FOC_root_method` stops short of a root, and keeps the result with the smaller maximum residual. The `hybr` method can return "not making good progress" after a handful of evaluations when started far from the solution, in which case the returned point is just the initial guess. The fallback is applied to the oldest household's problem (`firstdoughnutring`), the partial-lifetime problems of households alive at `t=0`, and the full-lifetime problems (`twist_doughnut`).
+- Adds `TPI._euler_error_message` so that a failed Euler-error check at the end of `run_TPI` reports the largest savings and labor FOC residuals and the (period, age, income group) at which each occurs, flagging households that were alive when the time path began.
+- `utils.get_initial_path` now accepts scalars and `1 x M` vectors as well as `S x J` arrays, returning paths of size `T+S`, `(T+S) x M`, or `(T+S) x S x J`. Optional `S` and `J` arguments declare the `S x J` layout for the ambiguous case `S=1, J=M`.
+
+### Updated
+- `retirement_age` is now a single value and `retire` is a `(T+S) x S` integer array of the retirement period for the household of age `s` in period `t` (it was a length `T+S` array by calendar year). A year-varying `retirement_age` list raises an error that points at `pension_regimes`, since a retirement age that changes by calendar year is not a property of any cohort. This is a breaking change for code that read `p.retire` as a vector or entered a `retirement_age` path. `pensions.SS_amount` is rewritten around `retirement_mask`: the `retireTPI` index arithmetic and the per-period loops in the `(T, S)` and `(T, S, J)` branches are gone, and the 1D branch no longer indexes `theta` by `j`. Also breaking: `pensions.NDC_amount` takes `t` and `method` arguments like `DB_amount`; `pensions.pension_periods` returns `(T+S) x S` arrays rather than three integers; the `DB_1dim_loop`, `DB_2dim_loop`, `DB_3dim_loop`, `NDC_1dim_loop`, and `NDC_2dim_loop` signatures take per-age (or per-period-and-age) arrays of the pension parameters and no longer take the scratch arrays; and after `compute_default_params` the attributes `alpha_db`, `avg_earn_num_years`, `yr_contrib`, `tau_p`, `k_ret`, and `indR` hold the expanded period-by-age arrays (the user's base values remain in the ParamTools data).
+- Renames the initial-period wealth objects in `TPI.py` to make the age timing explicit. In `get_initial_SS_values`, the baseline steady-state savings rescaled to the period-0 population are now `initial_b_sp1` (savings chosen at age `s`, held at `s+1`), and `initial_b` is the corresponding `S x J` array of wealth held at age `s`, with zeros in the first row. `b_sinit` and `b_splus1init` are copies of these two arrays, as before. This is a naming change only; the values of `B0`, `b_sinit`, and `b_splus1init` are unchanged.
+- Removes the redundant `initial_b` element (identical to `b_splus1init`) from the `initial_values` tuple returned by `TPI.get_initial_SS_values` and unpacked in `TPI.inner_loop` and `TPI.run_TPI`. The tuple is now `(B0, b_sinit, b_splus1init, factor, initial_n)`. All downstream uses in `inner_loop` (the arguments to `firstdoughnutring` and `twist_doughnut`) and in `run_TPI` (the initial guess for the savings path, `BQ0`, `bmat_s` in period 0, and `b_mat_shift`) now use `b_splus1init`.
+- Changes the initial guesses in `TPI.run_TPI`. The household savings and labor supply paths now use the `"quadratic"` shape in `utils.get_initial_path` rather than `"ratio"`. Aggregate household wealth `B` follows a quadratic path from its initial value to the steady state, the capital stocks `K`, `K_d`, and `K_m` scale with that path, and aggregate output `Y` is built up from industry output. Starting a reform instead from the period-0 capital stocks of the baseline time path (as in PR #1250) sent the outer loop onto a divergent track in `examples/multi_industry_example.py`, so baseline and reform runs use the same capital guesses; the loop recomputes these paths from household wealth and the fiscal rule after the first iteration, so they only affect the starting point. These changes affect only the starting point of the time path iteration, not the equilibrium it converges to (see the fix below for why the previous expected results differed).
+- The Euler errors returned by `TPI.inner_loop` are now stored in a `(T+S) x 2S` period-by-age layout aligned with `b_mat` and `n_mat`: entry `[t, s]` is the savings FOC residual and entry `[t, S+s]` the labor FOC residual of the age-`s` household in period `t`. The `euler_savings` and `euler_labor_leisure` outputs of `run_TPI` are `T x S x J` in the same layout, so they now cover every household solved along the path, including those alive at `t=0`.
+- Regenerates the expected results for `test_run_TPI_full_run`, `test_run_TPI`, `test_run_TPI_extra`, `test_get_initial_SS_values`, and `test_inner_loop` in `test_TPI.py`, and rebuilds the `tests/test_io_data/OUTPUT2` baseline fixture (used by the two-iteration reform tests and the serial test) from a converged baseline run of the tests' small `S=40, J=2` model with the current code. The old fixture predated industry capital and lacked the `K_m` entry the reform start-up now reads. The tests' variable-name mapping now falls back to the name itself for current output variables, and the comparison loops in `test_run_TPI_full_run` and `test_run_TPI` handle scalar outputs such as `factor`.
+- Updates `examples/multi_industry_example.py` so that it runs with the current parameters: adds `c_min` for the three consumption goods, moves the start year to 2026, and sets the initial steady-state interest rate guess to 0.115. All of its output now goes under `examples/MultiIndustryExample/`, with the plots in `example_plots/` and the summary table in `example_output.csv`, and the three industry plots are saved to separate files (`industry_output_path.png`, `industry_labor_path.png`, `industry_capital_path.png`) rather than overwriting one another.
+- Renames the output of `examples/run_ogcore_example.py` from `OG-Core_example_plots/` and `OG-Core_example_output.csv` to `example_plots/` and `example_output.csv`, and updates `test_run_example.py` to read the renamed table.
+- Removes the extraneous `requirements.txt` file. It was out of date (it listed `os`, which is part of the standard library, and `taxcalc`, which is not a dependency of OG-Core, and omitted the dependencies in `pyproject.toml`) and nothing in the build, tests, or workflows reads it.
+- Bump `certifi` from 2026.7.22 to 2026.10.19 in [PR #1259](https://github.com/PSLmodels/OG-Core/pull/1259).
+
+
+### Fixed
+- `pensions.delta_ret_loop` sets the first survival rate of its window to one in place, so a second call with the same array saw a modified survival rate at the previous retirement age; `delta_ret` now passes it a copy.
+- Fixes the application of `replacement_rate_adjust` on the household path along the time path. `TPI.inner_loop` pre-scaled `theta` by the adjustment before passing it to `firstdoughnutring` and `twist_doughnut`, and `pensions.SS_amount` then scaled it again, so for a uniform benefit cut the household first order conditions saw the factor squared while the aggregates and the saved `pension_benefits` applied it once. The cohort-path branch of `SS_amount` also indexed the pre-scaled vector by `j` and applied the factor for the cohort's entry period rather than the year of payment, so under a phased-in cut a cohort entering before the cut planned on full benefits that were never paid. `inner_loop` now passes the unadjusted `theta[j]`, and `SS_amount` and `pensions.replacement_rate_adjustment` index the cohort path by the year each benefit is paid, matching the `(T, S, J)` pension array. Adds tests of the household-path multiplier under a phased-in cut and of consistency between the household path and the `(T, S, J)` pension array. (Reported in connection with comparing OG-USA Social Security reforms to Microcosm Dynamics.) See PR #1261.
+- Corrects the note on `replacement_rate_adjust` in `default_parameters.json` and the parameter docs: the steady state uses the final value of the parameter rather than assuming it is one, so a permanent adjustment carries into the steady state that the time path converges to. See PR #1261.
+- Fixes a silent failure of the household solution for cohorts alive when the time path begins. In `TPI.inner_loop`, the residuals of the partial-lifetime problems (the upper triangle solved with `twist_doughnut` and the oldest household solved with `firstdoughnutring`) were never written to `euler_errors` and so were never checked by the Euler-error test at the end of `run_TPI`, which covered only cohorts born during the time path. With the previous `"ratio"` initial guess, which drops savings by half the gap to the steady state in the first period, `hybr` failed immediately (status 5) on many of these problems -- 76 of the 546 in the default baseline, for cohorts initially aged 63 to 78 in every income group -- and the initial guess was carried through as if it were a solution, with FOC residuals of order 0.3 to 2. Because the outer loop's damped update kept feeding the failed guess back in, these unconverged household paths survived to convergence and were embedded in the previously expected test results, moving early-period aggregates by about 0.1 percent. All household residuals are now stored and checked, failed problems are re-solved with Levenberg-Marquardt, and the regenerated expected results satisfy every household first order condition to machine precision.
+- Fixes docstring formatting in `output_tables.py`, `aggregates.py`, and `utils.py` that caused warnings in the documentation build, and replaces the equation in the `aggregates.get_B` docstring with the stationarized aggregate household wealth expression.
+- Fixes the stationarized aggregate household wealth equation {eq}`EqStnrz_Bt` in `stationarization.md`, which was missing the hat on the first savings term.
+
+## [0.21.2] - 2026-10-14
+
+### Fixed
+ The cache of auto-detected household Jacobian sparsity patterns in `TPI` (used when `use_sparse_FOC_jac` is True) was keyed only on the residual function name and problem size, so a pattern detected for one parameterization was reused for every later `run_TPI` call in the same process, including on long-lived dask workers. A pattern detected under `US-Style Social Security` (banded) was then applied to a `Defined Benefits` run, whose retirement-age conditions depend on working-age labor, and the household solves converged to slightly wrong values. The cache is now scoped to a single `run_TPI` call via `p._jac_cache_scope` and emptied when a new run begins.
+- Adds `tests/test_io_data/run_TPI_outputs_DB.pkl`, which was not committed with the additional test in `test_run_TPI_extra` in `test_TPI.py` committed previously.
+
+## [0.21.1] - 2026-10-12
+
+### Fixed
+- `pensions.DB_amount` raised a `TypeError` on the transition path with the Defined Benefits pension system. `TPI.firstdoughnutring` solves the household in its final period of life at `t = 0` and passes `t = None` with method `'TPI_scalar'`, and the short-horizon branch of `DB_amount` used `t` to index the replacement rate path. `DB_amount` now treats `t = None` as period 0 in that branch, consistent with the other `'TPI_scalar'` branches.
+- The conversion of `avg_earn_num_years` and `yr_contrib` from calendar years to model periods subtracted one period, so the Defined Benefits system averaged earnings over one fewer year and credited one fewer year of contributions than the parameters state, and `avg_earn_num_years=1` gave a zero-length window: a 0/0 NaN replacement rate under `US-Style Social Security` and a `ZeroDivisionError` under `Defined Benefits`. A new `pensions.pension_periods` helper rounds `S/80 * years` with no shift and is used by `DB_amount` and `deriv_DB`, so the DB code matches the documented formula. `replacement_rate_vals` keeps the one-period shift in the Social Security averaging window so that pinned steady-state and time-path results are unchanged, but floors the window at one period so a one-year window no longer produces NaN; removing that shift (the highest 35 years with the default `avg_earn_num_years=35` rather than 34) requires regenerating the pinned model outputs in `tests/test_io_data` and is left for a separate change.
+- The partial-lifetime branch of `pensions.DB_amount` (cohorts alive when the time path begins) used the steady-state earnings profile `e` over the whole lifetime. It now uses the profile in effect in the period each age is lived in, with ages before the path anchored to the period-0 profile (as the wage is) and ages beyond the path using the final profile. The full-time-path (`T x S x J`) branch and the `NDC_amount` and `PS_amount` partial-lifetime branches still use the steady-state profile (see Issue #1014).
+- `pensions.pension_periods` raises a `ValueError` when the averaging window is shorter than one model period or longer than the working life. The `avg_earn_num_years` validator allows values up to `retirement_age`, but a window longer than `retirement_age - starting_age` indexed before the first period of life and silently averaged in earnings from the oldest ages.
+- Adds `test_pension_periods_conversion_and_bounds` to `test_pensions.py` and updates the expected values of the `replacement_rate_vals`, `DB_amount`, `deriv_DB`, `pension_amount`, and `deriv_theta` tests to the unshifted period counts. Fixes a typo in the `Incomplete` case of `test_DB` that set `avg_earn_num_years` on the wrong parameters object.
+- Adds `test_DB_amount_first_doughnut_ring_t_none` to `test_pensions.py` and a `Baseline, Defined Benefits pension` parameterization of `test_run_TPI_extra` in `test_TPI.py` (expected output in `run_TPI_outputs_DB.pkl`) so that the transition path is solved with the Defined Benefits system.
+
+## [0.21.0] - 2026-10-07
+
+### Added
+- Allows the defined benefit pension replacement rate `alpha_db` to vary across lifetime income groups and over time. The parameter is now a `T x J` array (`number_dims` changed from 0 to 2 in `default_parameters.json`), extrapolated like the other `T x J` parameters, so a single value (`[[0.02]]`), one value per income group, or a time path can be entered. The rate applied to a benefit is the one in effect in the period in which the benefit is paid, so a change in the rate affects current as well as future retirees. Reform JSON files or scripts that previously set `alpha_db` as a scalar (e.g., `0.02`) must now use the nested list form (e.g., `[[0.02]]`).
+- Adds tests in `test_pensions.py` of DB benefits that vary by group in the steady state, of an incomplete lifetime straddling a change in the rate along the time path, of the derivative of benefits with a time-varying rate, and of consistency between the cohort-by-cohort and full-time-path computations of DB benefits with a rate that varies over time and by group.
+
+### Updated
+- `pensions.DB_amount` now takes `t` and `method` arguments (`DB_amount(w, e, n, t, j, method, p)`) so that it can select the replacement rate for the period in which each benefit is paid. `pensions.DB_1dim_loop`, `DB_2dim_loop`, and `DB_3dim_loop` take the replacement rate as an array indexed by age (or by period for the full time path) rather than a scalar.
+- `pensions.deriv_DB` and `pensions.deriv_theta` now take `t` and `j` arguments. With a time-varying rate, the derivative of benefits with respect to labor supply at each working age is evaluated at the rate in effect when the household retires. `deriv_theta` is not yet used in the household first order conditions, so this has no effect on model solutions.
+- Fixes the title and description of `alpha_db` in `default_parameters.json`, which referred to a defined contribution system.
+- Updates the defined benefit pension equations in the theory documentation (`government.md`) to use $\alpha^{DB}_{j,t}$.
+
+## [0.20.4] - 2026-10-05
+
+### Added
+- Allows the linear payroll tax rate `tau_payroll` to vary across lifetime income groups as well as over time. The parameter is now a `T x J` array (`number_dims` changed from 1 to 2 in `default_parameters.json`), extrapolated like `labor_income_tax_noncompliance_rate` and `income_tax_filer`, so a single value (`[[0.1]]`), one value per income group (`[[0.1, ..., 0.2]]`), or a time path (`[[0.1], [0.12]]`) can be entered. Reform JSON files or scripts that previously set `tau_payroll` as a flat list (e.g., `[0.124]`) must now use the nested form (e.g., `[[0.124]]`).
+- Adds a `vary tau_payroll by J` case to `test_FOC_labor` in `test_household.py`, a `tau_payroll` extrapolation test to `test_parameters.py`, and a hand-computed check of `get_payroll_tax_revenue` with group-specific rates in `test_aggregates.py`.
+- Adds a `by_J` keyword argument (default `False`) to the demographic plotting functions in `parameter_plots.py` (`plot_imm_rates`, `plot_mort_rates`, `plot_population`, `plot_fert_rates`, `plot_mort_rates_data`, `plot_omega_fixed`, `plot_imm_fixed`, `plot_population_path`) now that the demographic objects are T x S x J. With `by_J=False`, population distributions are summed across income groups and rates are averaged across income groups using the population weights in `omega`, so one line is plotted for the overall population. With `by_J=True`, one line is plotted per income group and labeled with the j value. The array-based functions take an `omega` (or `omega_list`) argument to supply the weights. Each function checks the dimensions of its inputs and continues to accept objects without an income-group dimension (e.g., `T x S` or `S` arrays).
+
+### Updated
+- `tax.income_tax_liab` and `household.FOC_labor` now select `tau_payroll` by `j` (or across all `J` when `j` is `None`) in the same way as the tax noncompliance rates and filer status.
+- `aggregates.get_payroll_tax_revenue` now takes household labor supply `n`, effective labor `e`, and population weights in place of aggregate labor `L`, and computes payroll tax revenue as the population-weighted sum of `tau_payroll[t, j] * w * e * n` across households, which is required when the rate differs across income groups. When `tau_payroll` is zero everywhere, the `frac_tax_payroll` fallback is unchanged.
+- `Specifications.compute_default_params` now collapses a previously extrapolated `T x J` parameter (`labor_income_tax_noncompliance_rate`, `capital_income_tax_noncompliance_rate`, `replacement_rate_adjust`, `income_tax_filer`, `wealth_tax_filer`, `tau_payroll`) back to a single column when `J` changes and the values are the same across groups, so that these parameters need not be re-specified whenever `J` is changed via `update_specifications` (the `T x S x J` demographic and ability parameters still must be).
+- Fixes the population weighting in `plot_mort_rates`, which multiplied mortality rates by the unnormalized population shares rather than taking a weighted average across income groups.
+- Fixes the year indexing in `plot_imm_rates`, `plot_mort_rates_data`, and `plot_population_path`, which indexed years as `start_year - year` rather than `year - start_year`.
+
+## [0.20.3] - 2026-10-01
+
+### Updated
+- Removes the ceiling on the `numpy` version in `pyproject.toml` to `"numpy>=2.5"`. All tests passed locally, except for the first test `test_run_ogcore_example()` (the time test) in `test_run_example.py` and the example run script ran successfully under the new repo (see output below). This resolves Issue #1233.
+- The pytest output for the failed test showed that the baseline and reform of the example script ran and finished in less than 300 seconds, which resulted in an error in the test (our model is running too fast for the test). As such, I updated  the `test_run_ogcore_example()` script in `test_run_example.py` to pass either if the model was running after 300 seconds or if it had a successful exit code.
+- Updates the six GitHub Action files (`build_and_test.yml`, `check_catalog.yml`, `check_ruff.yml`, `deploy_docs.yml`, `docs_check.yml`, `publish_to_pypi.yml`) to only run on pushes and pulls to the `master` branch of the `PSLmodels/OG-Core` repository.
+- Fixes some warnings and errors in the documentation. This entailed changes in some of the `/ogcore/*.py` file docstrings, `*.bib` files, `*.rst` files, and `*.md` files.
+- Updates the `uv.lock`
+
+## [0.20.2] - 2026-09-30 13:00:00
+
+### Added
+- SAU UN codes to `demographics.py`
+- Report aggregate hours worked in SS and TPI output dictionaries
+- Parameterize the initial guesses for `b` and `n` in the SS solution algorithm
+- Allow for a local currency conversion in `output_tables.npv_table`
+
+
+## [0.20.1] - 2026-09-17 15:00:00
+
+### Added
+
+- Fixes Issue [#1202](https://github.com/PSLmodels/OG-Core/issues/1202): `get_r_gov` clipped the interest rate on government debt at zero, so a sovereign that genuinely pays a negative real rate could not be modelled. The bound is now a parameter, `r_gov_floor`, with a default of 0.0 that reproduces the previous behaviour exactly.
+- `npv_table` in `output_tables.py` (Issue #1131): builds a table of the net present value of the reform-minus-baseline change in flow variables (e.g. `Y`) over a horizon, evaluated at a list of discount rates. Values are un-stationarized by default so the NPV is taken over the actual (trend-inclusive) level path.
+- New resource constraint error message, noting the maximum absolute resource-constraint error, the period it occurs in, and the tolerance, plus a one-line note on how to read it
+- Scatter parameters object once per SS solve instead of one per residual evaluation. Pure overhead removal on any Dask-backed SS solve; the larger the Specifications object and the more workers, the more it saves. No numerical change — same solves, same results.
+
+### Bug Fixes
+
+- Fixes Issue [#1200](https://github.com/PSLmodels/OG-Core/issues/1200): `replacement_rate_adjust` was read only inside `SS_amount`, so it applied to the US-Style Social Security system and was silently ignored under Defined Benefits, Notional Defined Contribution, and Points System. The adjustment is now applied to those three systems in `pension_amount`, via a `replacement_rate_adjustment` helper that mirrors the indexing `SS_amount` already uses, including the per-cohort `t + tt` offset along the time path. `SS_amount` is unchanged, so US-Style results cannot move.
+
+## [0.20.0] - 2026-08-13 12:00:00
+
+### Added
+
+- Addresses Issue [#1205](https://github.com/PSLmodels/OG-Core/issues/1205): the UN Data Portal API token can now come from a `un_token` argument to `demographics.get_un_data`, from a `UN_API_TOKEN` environment variable, or from a single per-user file (`$XDG_CONFIG_HOME/og/un_api_token.txt`, or `%APPDATA%\og\un_api_token.txt` on Windows). Sources are tried in that order, then `un_api_token.txt` in the working directory. This gives one token per user instead of one per directory.
+- An `og-token` command, OG-Core's first console script, to manage that token without hunting for the file: `og-token set` saves one, `og-token show` reports where it lives and which source wins, and `og-token rm` deletes it. The token is read without echoing and is never printed back.
+
+### Changed
+
+- Answering the UN API token prompt now saves the token to the per-user file rather than to the current working directory, which used to leave a copy of the token in every directory a model was run from. An existing `un_api_token.txt` in the working directory is still read, with a notice that the location is deprecated.
+- The token prompt now names both ways forward: where to generate a free token, and that pressing return uses the archived copy of the same data instead.
+- The token is read with `getpass` rather than `input`, so it is no longer echoed into the terminal and its scrollback while being typed or pasted.
+- An expired token is now named as the reason for falling back to the archived data, instead of failing the same way as a missing one. The portal issues JSON Web Tokens, so the expiry date is read locally with no extra request, and `og-token show` reports whether the stored token is still current. A token that is not a readable JSON Web Token is used as before, with no expiry reported.
+- A run that falls back to the archived data now says once, not once per series, how to register a token: where to get one, the full path of the `og-token` command belonging to the running interpreter, and the token file to write. The full path matters because `og-token` is installed beside the interpreter and is normally not on the shell's PATH, so someone who obtains a token days later has something they can paste rather than a command that reports "not found".
+- The token prompt is skipped when standard input is not interactive, so scheduled and scripted runs fall back to the Population-Data archive instead of waiting on input.
+
+## [0.19.2] - 2026-08-18 17:00:00
+
+### Adds
+- Updates `.gitignore` to include a line `.claude/`.
+- Updates the `uv.lock` file to include upgraded `pillow` package version 12.3.0. This satisfies the dependabot PR update in PR #1176. I updated all the packages in the environment. This resulted in an update of the `pytest` package, which caused errors that led to the changes below.
+- Updated the version in `pyproject.toml`, `ogcore/__init__.py` and `CHANGELOG.md`.
+- Updated the version of `pytest` in `pyproject.toml` to `pytest>=9.1`. Some changes to logging happened in versions 9.1+, that are not backward compatible. All our testing started throwing errors once I updated that package. I changed the `pytest` miniversion in line 94 of `pyproject.toml` to 9.1, and I updated the `filterwarnings` in lines 94-98.
+- I updated all the `Makefile` commands to fit with standard GNU formatting and to work with our updated usage of the `uv` package. I also got rid of some compute studio commands, the objects of which had no targets.
+- I updated the format of the `logger.info()` warnings in `household.py` which was a source of errors from the updated `pytest` package.
+- I fixed some errors that were happening in the building of our Jupyter Book documentation. There was a fight going on between our `make_params.py` and `make_vars.py` scripts and the Sphinx `_toc.yml` table of contents script. And we were missing `config.rst`, `SS.rst`, and `TPI.rst` files. I explicitly put the API chapters in the `_toc.yml` file. And I built an updated `parameters.md` file.
+- We had some Jupyter Book warnings for headings that go from H2 to H4 in parameters.md and variables.md. However, this is what we want. So  I added the `_ext/supress_header_warnings.py` file and referenced it in `_config.py` in order to surpress only those warnings associated with only the `parameters.md` and `variables.md` files.
+
+### Bug Fixes
+
+- Fixes Issue [#1199](https://github.com/PSLmodels/OG-Core/issues/1199): `aggregates.revenue` counted payroll tax revenue twice. Each household's `income_payroll_tax_liab` already includes `T_P = tau_payroll * labor_income`, so payroll revenue is inside `iit_payroll_tax_revenue`; PR #1184 then added `get_payroll_tax_revenue` (the same take, re-derived from the aggregate wage bill) into that total again when `tau_payroll` was nonzero. Revenue was overstated, the government over-spent, and any model with a nonzero `tau_payroll` failed the steady-state resource constraint (OG-USA was unaffected only because its `tau_payroll` is 0). The erroneous addition is removed; `get_payroll_tax_revenue` still provides the income vs payroll reporting split, which is unchanged. (See [PR #1204](https://github.com/PSLmodels/OG-Core/pull/1204) and [PR #1199](https://github.com/PSLmodels/OG-Core/pull/1199).)
+
+## [0.19.1] - 2026-08-10 12:00:00
+
+### Added
+
+- Stall detection for the TPI outer loop (Issue #1177): when the best distance has not improved over the last `TPI_stall_window` iterations (default 50; 0 disables), `run_TPI` logs a diagnosis distinguishing a cycling outer loop (suggesting a lower `nu` or `TPI_outer_method="anderson"`) from a diverging economy (usually an inconsistent fiscal block, which solver settings cannot fix). The default `TPI_stall_action="warn"` only logs, leaving model solutions unchanged; `"stop"` also ends the loop early, so a hopeless run fails through the existing non-convergence checks instead of spending the rest of `maxiter`. The window check lives in `ogcore.solvers.diagnose_stall` and works for both the picard and anderson update rules. The diagnosis is re-logged if it changes (e.g. escalates from cycling to diverging), and a run that ends unconverged while stalled carries the diagnosis in the `RuntimeError` message, so it reaches users who only see the traceback. [PR #1178](https://github.com/PSLmodels/OG-Core/pull/1178).
+- Changes the default of `stationarized` to `False` in `output_plots.plot_aggregates` and `output_plots.plot_industry_aggregates`, so unstationarized values are plotted by default, resolving Issue [#1133](https://github.com/PSLmodels/OG-Core/issues/1133). [PR #1183](https://github.com/PSLmodels/OG-Core/pull/1183).
+
+### Bug Fixes
+
+- Fixes Issue [#1186](https://github.com/PSLmodels/OG-Core/issues/1186): with demographics that vary across lifetime income groups (introduced in PR #1165), the `use_zeta = False` branch of `household.get_bq` divided each group's bequest pool by its birth share (`lambdas[j]`) rather than its actual population share, so bequests received did not sum to bequests left and the steady-state resource constraint failed. Receipts are now divided by the group's actual population (from `omega_SS` / `omega`), matching the `use_zeta = True` branch. Results are unchanged when demographics are common across groups. [PR #1187](https://github.com/PSLmodels/OG-Core/pull/1187).
+- Fixes Issue [#1015](https://github.com/PSLmodels/OG-Core/issues/1015): fixes escape with special characters in parameter names that caused failures when reading from JSON files. Adds a test to prevent this in the future. [PR #1193](https://github.com/PSLmodels/OG-Core/pull/1193).
+- Resolve Issue [#1152](https://github.com/PSLmodels/OG-Core/issues/1152): expose same keys in the steady-state and time path dictionaries. [PR #1185](https://github.com/PSLmodels/OG-Core/pull/1185).
+- Correct payroll tax calculations, resolving Issue [#1023](https://github.com/PSLmodels/OG-Core/issues/1023). [PR #1184](https://github.com/PSLmodels/OG-Core/pull/1184).
+
+## [0.19.0] - 2026-07-29 12:00:00
+
+### Added
+
+- Fixes Issue [#1169](https://github.com/PSLmodels/OG-Core/issues/1169): the Notional Defined Contribution pension system could not run against a real `Specifications` object because its growth-rate settings were not parameters. `ndc_growth_rate`, `dir_growth_rate`, and `points_growth_rate` are now parameters in `default_parameters.json` (choices `"r"`, `"Curr GDP"`, `"LR GDP"`; default `"LR GDP"`, matching the previous fallback behavior). `g_ndc` and `g_dir` now handle the scalar `r` and `g_y` of the steady state, and `delta_ret` falls back to the steady-state mortality rates implied by `rho` (averaged over lifetime income groups) when no `mort_rates_SS` attribute is set. The NDC system is added to the real-`Specifications` pension test.
+
+## [0.18.1] - 2026-07-22 12:00:00
+
+### Bug Fixes
+
+- Fixes Issue [#1180](https://github.com/PSLmodels/OG-Core/issues/1180): `get_pop_objs` raised an `AssertionError` for the homogeneous case (`income_percentiles=None` with no income-specific inputs), because `expand_pop_obj_J` asserted before reaching its homogeneous branch. `income_percentiles` now defaults to a single income group (J=1) when no income-specific inputs are supplied, restoring the pre-0.18 call signature; it remains required whenever gradients or immigrant income shares are provided. Also removes a stray debug `print` from that branch.
+
+## [0.18.0] - 2026-07-20 12:00:00
+
+### Added
+
+- Demographic parameters (`rho`, `omega`, `imm_rates`) are now allowed to vary across lifetime income groups, `J`. See PR [#1165](https://github.com/PSLmodels/OG-Core/pull/1165)
+
+## [0.17.0] - 2026-07-16 12:00:00
+
+### Bug Fixes
+
+- Fixes the Defined Benefits and Points System pension paths so they run against a real `Specifications` object (Issues #1014 and #1075): `p.retire` (an array since PR #433) was passed as the scalar `S_ret` into the numba loops, the scalar `p.g_y` was indexed as an array inside the loops, the scalar steady-state wage was indexed as a path, and the time-varying 3-D `e` matrix (PR #895) was sliced as 2-D. The systems use the steady-state retirement age and earnings profile for now; full time variation remains open in Issue #1014. The same coercions are applied to the NDC path, but the NDC system additionally requires growth-rate settings (`ndc_growth_rate`, `dir_growth_rate`) that are not yet parameters in `default_parameters.json`, so it still cannot run against a real `Specifications` object (see Issue #1169).
+- Wires the pre-time-path inputs the DB/NDC/PS benefit formulas need into the TPI: labor supplied before the time path begins comes from the model's initial condition (the same baseline object that initializes wealth), and pre-time-path wages are anchored to the period-0 wage of the current path. Adds the full time-path (T x S x J) evaluation of Defined Benefits amounts (`DB_3dim_loop`) used when the TPI computes aggregate revenues, built from each cohort's own wage and labor history so aggregates are consistent with household behavior. With these changes a country model using the Defined Benefits system solves both the steady state and the transition path.
+- Adds regression tests that call `pension_amount` with a real `Specifications` object per pension system (the existing tests pre-scalarized the inputs and so never exercised the real interface) and a local-marked steady-state solve test with the Defined Benefits system. See PR [#1167](https://github.com/PSLmodels/OG-Core/pull/1167).
+- Fixes the tax-liability revenue calculation using the first year's tax noncompliance and filer rates for every period, even when those rates are set to vary over time (Issue #1168): households responded to the changing rates while government revenue, the budget, and debt stayed on the first-year values. `income_tax_liab` now slices the rates over the transition path. See PR [#1174](https://github.com/PSLmodels/OG-Core/pull/1174).
+- Fixes the steady-state `etr_ss` and `mtry_ss` diagnostics using the labor-income tax noncompliance rate in place of the capital-income rate (`capital_noncompliance_rate_2D` in `SS.py`, Issue #1170). This affects only the post-solve SS diagnostics -- the solution itself already used the correct rates -- and is a no-op when the two rates are equal (the default). See PR [#1171](https://github.com/PSLmodels/OG-Core/pull/1171).
+- Fixes `alpha_FA` (direct foreign aid, added in 0.16.0) not being extended over the model time path: it was never registered in `tp_param_list`, so a multi-year path stayed short and broke the transition solve. It now extends to `T + S` with the last value carried forward, like `alpha_G`/`alpha_T`/`alpha_I`. See PR [#1166](https://github.com/PSLmodels/OG-Core/pull/1166).
+
+## [0.16.4] - 2026-07-02 12:00:00
+
+### Added
+
+- Adds an opt-in accelerated update rule for the TPI outer loop, selected by the new `TPI_outer_method` parameter (default `"picard"`, which leaves the model's historical damped functional iteration and all model solutions unchanged). Setting `TPI_outer_method="anderson"` uses limited-memory Anderson acceleration on the outer-loop residual history, guarded by a trust region anchored to the always-feasible damped point (controlled by `TPI_anderson_m`, `TPI_anderson_beta`, and `TPI_trust_radius`). On a stiff multi-industry reform that limit-cycles under constant dampening, this converged to the same equilibrium in 53 outer iterations vs 126 for constant `nu=0.1` (about −37% wall-clock vs the best damped-`nu` schedule). The new solver lives in `ogcore/solvers.py`. See PR [#1164](https://github.com/PSLmodels/OG-Core/pull/1164).
+
+## [0.16.3] - 2026-06-25 15:00:00
+
+### Added
+
+- Better functionality and more country repositories with the OG installer. See PR [#1162](https://github.com/PSLmodels/OG-Core/pull/1162)
+
+### Bug Fix
+- Fixes an inconsistency with the pre-time path population distribution and growth rates. Note that the `demographics.get_pop` function has been changed and now only returns one object: the population distribution (not also the distribution prior to the start year).  In addition, the `get_pop` and `get_pop_objs` functions no longer have the `pre_pop_dist` kwarg. See PR [#1073](https://github.com/PSLmodels/OG-Core/pull/1073).
+
+## [0.16.2] - 2026-06-15 12:00:00
+
+### Added
+
+ - Adds `output_tables.model_fit_table` function that generates a table comparing model output to data for a set of target moments, and adds a test of this function in `test_output_tables.py`. The function takes as input a list of target moment descriptions, the TPI output dictionary, and the model parameters object, and returns a pandas DataFrame with the target moment descriptions, the model values for those moments, and the data values for those moments (where applicable). The function currently supports a set of macroeconomic moments (interest rate, capital share of output, labor share of output), inequality moments (Gini coefficient for before-tax income and after-tax income), and demographic moments (fraction of population 65+ and population growth rate). See PR [#1138](https://github.com/PSLmodels/OG-Core/pull/1138).
+ - Validates `beta_annual` and `chi_b` against `J`. ([PR #1149](https://github.com/PSLmodels/OG-Core/pull/1149))
+
+### Bug Fixes
+- Fixes issue with reading UN data on Pandas >= 3.0 and UN token string. ([PR #1151](https://github.com/PSLmodels/OG-Core/pull/1151))
+- Fixes math notation for plot labels. ([PR #1148](https://github.com/PSLmodels/OG-Core/pull/1148))
+- Fixes reshaping issues with `J=1` parameterization. ([PR #1145](https://github.com/PSLmodels/OG-Core/pull/1145))
+
+
+## [0.16.1] - 2026-06-04 12:00:00
+
+### Added
+
+- Adds a `use_sparse_FOC_jac` `Specifications` parameter (default `True`) that accelerates the time path iteration (TPI) household solve. With it on, `scipy.optimize.root` is given a sparse (banded) finite-difference Jacobian for the stacked household Euler and labor first order conditions: the sparsity pattern is auto-detected once per problem size and the solver then needs far fewer function evaluations per Jacobian build (about 20x fewer on the default S=80 cohort solve), with an automatic fallback to dense finite differences if the Jacobian is not sparse enough to benefit or if a solve fails. The result matches the legacy dense-finite-difference solution to within the model's resource-constraint accuracy floor on every calibration tested (OG-Core standard example, OG-ETH, OG-ZAF, OG-PHL, OG-IDN), giving roughly a 1.9-2.4x TPI speedup at no accuracy cost. Set `use_sparse_FOC_jac=False` to recover bit-identical agreement with v0.16.0 and earlier.
+
+## [0.16.0] - 2026-06-02 12:00:00
+
+### Added
+
+- Adds a new parameter, `alpha_FA`, that allows the user to specify the level of direct foreign aid as a percentage of GDP.  See PR [#1126](https://github.com/PSLmodels/OG-Core/pull/1126).
+
+## [0.15.13] - 2026-05-15 06:00:00
+
+### Added
+
+- Increases the maximum value of the `mindist_TPI` parameter to 0.01 in `default_parameters.json`.
+- Updates the `uv.lock` with package updates.
+
+## [0.15.12] - 2026-05-14 12:00:00
+
+### Added
+
+- Caches the `e_long` array in `household.FOC_savings` and `household.FOC_labor` rather than rebuilding it on every call. `e_long` is a pure function of `p.e`, `p.S`, and `p.J`, none of which change during a solve, so a `_get_e_long` helper now builds it once per worker and reuses it. Profiling identified this rebuild as the single most expensive operation in a TPI run. The change is a pure cache — model output is bit-for-bit identical to master — and gives roughly a 3x speedup on a single-reform TPI run. See PR [#1128](https://github.com/PSLmodels/OG-Core/pull/1128).
+- Builds the per-period tax-parameter slices in `TPI.inner_loop` as numpy arrays via a new `_params_to_array` helper, and switches `txfunc.get_tax_rates` to `np.asarray`, so the repeated per-call list-to-array conversion is skipped on the hot TPI path. `mono` and `mono2D` tax functions store callables rather than numbers, so their nested-list form is passed through unchanged. Profiling identified this conversion as the next hot spot after the `e_long` rebuild. Model output is bit-for-bit identical to master, and the change gives roughly a further 10% speedup on a single-reform TPI run (about 3.3x cumulative versus master). See PR [#1128](https://github.com/PSLmodels/OG-Core/pull/1128).
+- Changes the minimum of the allowable range for `tau_c` in `default_parameters.py` to allow for government consumption subsidies.
+- Fixes a bug in the `parameter_plots.plot_fert_rates` function. See PR [#1127](https://github.com/PSLmodels/OG-Core/pull/1127).
+
+## [0.15.11] - 2026-05-08 12:00:00
+
+### Added
+
+- Updates the `uv.lock` to include dependabot upgrades PRs [#1118](https://github.com/PSLmodels/OG-Core/pull/1118), [#1119](https://github.com/PSLmodels/OG-Core/pull/1119), [#1120](https://github.com/PSLmodels/OG-Core/pull/1120), and [#1121](https://github.com/PSLmodels/OG-Core/pull/1121), as well as some other package upgrades that were available.
+
+## [0.15.10] - 2026-04-23 12:00:00
+
+### Added
+
+- Updates `uv.lock` to include upgrade to package `nbconvert from 7.17.0 to 7.17.1. This was the subject of [PR 1110](https://github.com/PSLmodels/OG-Core/pull/1110). But we could not get its tests to pass.
+- Fixes typo in `CHANGELOG.md`
+
+
+## [0.15.9] - 2026-04-23 03:00:00
+
+### Added
+
+- Create a `ogcore` logging environment so that logging specificed in `ogcore.config` is not overridden by other logging configurations in user code. See PR [#1109](https://github.com/PSLmodels/OG-Core/pull/1109).
+- Includes [PR 1111](https://github.com/PSLmodels/OG-Core/pull/1111) and [PR 1112](https://github.com/PSLmodels/OG-Core/pull/1112) that change `build_and_test.yml` to not upload CodeCov statistics for PRs generated by dependabots and updates the `codecov-action` to v5.
+
+## [0.15.8] - 2026-04-16 00:30:00
+
+### Added
+
+- Updates the `uv.lock` file to the current version of `ogcore` package (0.15.8)
+- Adds `'**.lock'` to the paths in `build_and_test.yml` so that any changes to the `uv.lock` file trigger the GH Action CI tests in `build_and_test.yml`
+- Incorporates the dependabot updates to `uv.lock` versions from [PR 1105](https://github.com/PSLmodels/OG-Core/pull/1105) and [PR 1106](https://github.com/PSLmodels/OG-Core/pull/1106).
+
+## [0.15.7] - 2026-04-15 20:00:00
+
+### Added
+
+- Fixed some typos in `CHANGELOG.md` and `intro.md`
+- Added dependabot package version updates to `uv.lock` from [PR 1102](https://github.com/PSLmodels/OG-Core/pull/1102) and [PR 1103](https://github.com/PSLmodels/OG-Core/pull/1103)
+
+## [0.15.6] - 2026-04-15 16:00:00
+
+### Added
+
+- Changes to package files to use `uv` for packaging and running commands.  See PR [#1093](https://github.com/PSLmodels/OG-Core/pull/1093)
+
+## [0.15.5] - 2026-01-27 12:00:00
+
+### Added
+
+- Additional parameter metadata to `default_parameters.json`.  See PR [#1097](https://github.com/PSLmodels/OG-Core/pull/1097)
+
+## [0.15.4] - 2026-01-27 12:00:00
+
+### Added
+
+- Ability to simulate the model with a single type of household (`J=1`).  See PR [#1062](https://github.com/PSLmodels/OG-Core/pull/1062)
+
+## [0.15.3] - 2026-01-24 12:00:00
+
+### Added
+
+- Two new parameters, `income_tax_filer` and `wealth_tax_filer`, that determine whether certain types `j` pay income or wealth taxes, respectively.  See PR [#1084](https://github.com/PSLmodels/OG-Core/pull/1084)
+
+## [0.15.2] - 2026-01-22 12:00:00
+
+### Added
+
+- Two new parameters, `r_gov_DY` and `r_gov_DY2`, that allow the government interest rate to be a function of the debt-to-GDP ratio.  See PR [#1037](https://github.com/PSLmodels/OG-Core/pull/1037)
+
+## [0.15.1] - 2026-01-19 12:00:00
+
+### Added
+
+- A new parameter `c_min` to the `Parameters` class that allows the user to specify minium consumption amounts by consumption good.  See PR [#1085](https://github.com/PSLmodels/OG-Core/pull/1085)
+
+## [0.15.0] - 2025-12-03 12:00:00
+
+### Added
+
+- A new parameter `baseline_theta` to the `Parameters` class that allows the user to specify whether to use the steady-state replacement rate parameters from the baseline solution in a reform run.  See PR [#1077](https://github.com/PSLmodels/OG-Core/pull/1077)
+
+## [0.14.14] - 2025-11-24 12:00:00
+
+### Added
+
+- Create `SS.SS_initial_guesses` function to allow more flexible initial guesses for steady state solution ((PR #1061)[https://github.com/PSLmodels/OG-Core/pull/1061])
+- Robust steady-state solution used for reform solution ((PR #1061)[https://github.com/PSLmodels/OG-Core/pull/1061])
+- Test of `SS.solve_for_j` function ((PR #1061)[https://github.com/PSLmodels/OG-Core/pull/1061])
+
+### Bug Fix
+- Fixes to deprecated API calls avoid many warnings during testing ((PR #1061)[https://github.com/PSLmodels/OG-Core/pull/1061])
+
+## [0.14.13] - 2025-11-21 12:00:00
+
+### Bug Fix
+
+- Fix calculation of consumption tax revenue with differentiated goods ((PR #1074)[https://github.com/PSLmodels/OG-Core/pull/1074])
+
+## [0.14.12] - 2025-11-07 12:00:00
+
+### Bug Fix
+
+- Use data for pre-time path population distribution (rather than inferring it) ([PR #1071](https://github.com/PSLmodels/OG-Core/pull/1071))
+
+## [0.14.11] - 2025-11-07 12:00:00
+
+### Added
+
+- Adds Ethiopia demographic data mapping ((PR #1063)[https://github.com/PSLmodels/OG-Core/pull/1063])
+-
+## [0.14.10] - 2025-09-11 12:00:00
+
+### Added
+
+- Fixes nonconformable matrices in `TPI.py` introduced in version 0.14.9 ((PR #1054)[https://github.com/PSLmodels/OG-Core/pull/1054])
+
+## [0.14.9] - 2025-09-10 20:00:00
+
+### Added
+
+- Fixes `replacement_rate_adjustment` parameter in the steady state ((PR #1053)[https://github.com/PSLmodels/OG-Core/pull/1053])
+- Adds some saved output to `tpi_vars.pkl` object ((PR #1054)[https://github.com/PSLmodels/OG-Core/pull/1054])
+
+## [0.14.8] - 2025-08-26 12:00:00
+
+### Added
+
+- Adds a complete benchmark suite for measuring and optimizing Dask performance in OG-Core, with particular focus on Windows performance issues.
+- New and updated files:
+    - tests/test_dask_benchmarks.py: Mock benchmark tests with synthetic workloads
+    - tests/test_real_txfunc_benchmarks.py: Real-world tax function benchmarks
+    - tests/run_benchmarks.py: Automated benchmark runner with reporting
+    - tests/BENCHMARK_README.md: Comprehensive documentation and usage guide
+    - pytest.ini: Updated with benchmark test markers
+- Key features:
+    - Platform-specific optimization tests (Windows, macOS, Linux)
+    - Memory usage and compute time benchmarking
+    - Baseline establishment and performance regression detection
+    - Comparison of different Dask schedulers and client configurations
+    - Real tax function estimation performance measurement
+    - Automated identification of optimal Dask settings per platform
+- Benefits:
+    - Establishes performance baselines before optimization work
+    - Identifies Windows-specific Dask performance bottlenecks
+    - Provides automated regression detection for future changes
+    - Enables data-driven optimization decisions
+    - Supports continuous performance monitoring
+- Usage:
+    - `python tests/run_benchmarks.py  # Run all benchmarks`
+    - `python tests/run_benchmarks.py --quick  # Quick benchmarks only`
+    - `python tests/run_benchmarks.py --save-baseline  # Save performance baseline`
+    - `python tests/run_benchmarks.py --compare-baseline # Compare against baseline`
+- 🤖 Generated with help from Claude Code
+
+## [0.14.7] - 2025-08-21 17:00:00
+
+### Added
+
+- Refactor calls to dask in `SS.py` and `TPI.py`.  See PR [#1048](https://github.com/PSLmodels/OG-Core/pull/1048)
+
+## [0.14.6] - 2025-08-15 14:00:00
+
+### Added
+
+- Removes `initial_guess_w_SS` in `default_parameters.json`
+- Updates environment and testing to cover Python 3.13
+
+## [0.14.5] - 2025-07-08 22:00:00
+
+### Added
+
+- Increases the maximum value of `initial_guess_TR_SS` in `default_parameters.json`
+
+## [0.14.4] - 2025-06-23 18:00:00
+
+### Added
+
+- Fixes the sign error on the remittances `RM` term in `aggregates.py`, `resource_constraint()` function.
+- Added a test with positive remittances to `test_aggregates.py`, `test_resource_constraint()` function.
+
+## [0.14.3] - 2025-04-25 10:00:00
+
+### Added
+
+- Puts a ceiling on the version of the `marshmallow<4.0.0` package in `environment.yml`
+- Update `txfunc.py` for the estimation of the `HSV` and `GS` tax functions.
+- Update `test_txfunc.py`, `tax_func_estimate_outputs.pkl`, and `tax_func_loop_outputs.pkl` files for testing
+- Update `dask` and `distributed` client calls in `SS.py` and `TPI.py` to allow for updated versions.
+
+## [0.14.2] - 2025-04-04 12:00:00
+
+### Added
+
+- `utils.pct_change_unstationarized` replaced with `utils.unstationarize_vars`, which allows for more general use of a utility to find unstationarized values of time series output
+- `output_plots.py` and `output_tables.py` are updated to all for plots and tables of unstationarized output for variables of any type, not just percentage changes.
+- `ouput_tables.tp_output_dump_table` has been renamed `output_tables.time_series_table`
+- `utils.param_dump_json` has been renamed `utils.params_to_json`
+- API docs have been updated to include functions left out previously and for new function names
+
+## [0.14.1] - 2025-03-16 12:00:00
+
+### Bug Fix
+
+- Packages `model_variables.json` with `ogcore`
+
+## [0.14.0] - 2025-03-16 07:00:00
+
+### Added
+
+- Updates the output dictionaries for `TPI.py` and `SS.py` to use consistent variables names
+- Adds a `model_variables.json` file that has metadata about the model variables and is used to build a new chapter in the documentation describing the model variables
+- Replaces `print` commands in `TPI.py` and `SS.py` with `logger.info` commands for easier suppression of output
+
+## [0.13.2] - 2024-12-08 12:00:00
+
+### Added
+
+- Adds KOR, THA, BRA to the list of countries in the `demographics.py` module.
+
+## [0.13.1] - 2024-10-02 12:00:00
+
+### Added
+
+- Three new parameters to adjust government spending amounts in the case of `baseline_spending=True`:
+  - `alpha_bs_G`: the proportional adjustment to the level of baseline spending on government consumption (time varying, default value is 1.0 for each model period)
+  - `alpha_bs_T`: the proportional adjustment to the level of baseline spending on non-pension transfers (time varying, default value is 1.0 for each model period)
+  - `alpha_bs_I`: the proportional adjustment to the level of baseline spending on infrastructure investment (time varying, default value is 1.0 for each model period)
+
+## [0.13.0] - 2024-09-26 12:00:00
+
+### Added
+
+- Updates all of the documentation.
+    - Adds remittances to all instances of the household budget constraint
+    - Rewrites bequests and transfers components of household budget constraint in terms of individual variables in all instances
+    - Adds a household transfers section to `households.md` with subsections on bequests, remittances, government transfers, and universal basic income
+    - Changes all instances of $p_t Y_t$ to $Y_t
+    - Updates the steady-state equilibrium algorithm description in `equilibrium.md`
+    - Added updates to the government pensions descriptions in `government.md` and added `pensions` to all instances of the household budget constraint.
+    - Updates the docstrings in `tax.py` for the wealth tax ETR and MTR functions. The code is right. I just thought there was a clearer specification of the equations in LaTeX.
+- Adds remittances to the OG-Core code
+    - Adds aggregate remittances function `get_RM()` to `aggregates.py`
+    - Adds household remittances function `get_rm()` to `household.py`
+    - Adds four new remittance parameters: `alpha_RM_1`, `g_RM`, `alpha_RM_T`, `eta_RM`
+    - We model aggregate remittances as a percent of GDP in the first period, then growing at a specified rate that can deviate from the country growth rate until the cutoff rule period, after which the remittance growth rate trends back to the long-run model growth rate (growth rate in population and productivity). We also model remittances in reforms as being a percentage of baseline GDP. In this way, if remittance parameters are not changed in the reform, remittances remain at their baseline levels. The only way they change is if their parameter values are changed.
+    - Adds 3 tests using the `test_get_RM()` function in `test_aggregates.py`
+    - Adds 4 tests using the `test_get_rm()` function in `test_household.py`
+    - Changes the `initial_guess_r_SS` in two tests in `test_SS.py` because they were not solving with their current values
+- Increases `RC_SS` steady-state resource constraint tolerance from 1e-9 to 1e-8 because two `test_run_SS()` tests were failing in `test_SS.py` with resource constraints errors just bigger than 1e-9 (-2.29575914e-09 for [Baseline, small open] and -2.29575914e-09 for [Reform, small open]).
+- Increases `RC_TPI` transition path resource constraint tolerance from 1e-5 to 1e-4 in because one `test_run_TPI_full_run()` test was failing in `test_TPI.py` with a resource constraint error just bigger than 1e-5 (1.4459913381864586e-05 for `[Baseline, M=3 non-zero Kg]`).
+- Updated two directory path references that were out of date in `test_run_example.py`.
+- Updated expected value tuples and dictionaries in `test_txfunc.py`.
+
+## [0.12.0] - 2024-08-20 12:00:00
+
+### Added
+
+- Support for Python 3.12
+
+## [0.11.17] - 2024-08-18 12:00:00
+
+### Added
+
+- Description of `alpha_I` in docs
+- Updates valid range of the nominal UBI parameters
+
+### Bug Fix
+
+- Extrapolate `alpha_I` in `parameters.py`
+- Ensure `alpha_I` shape conforms in `TPI.py`
+- Fix formatting of labels in `constants.py`
+
+## [0.11.16] - 2024-08-10 12:00:00
+
+### Added
+
+- Added parameter script `make_params.py` that generates a markdown file for the documentation `parameters.md`. Updates `Makefile`, and GitHub Actions ([PR #963](https://github.com/PSLmodels/OG-Core/pull/963))
+- Updated debt-to-GDP plot labels ([PR #962](https://github.com/PSLmodels/OG-Core/pull/962))
+
+## [0.11.15] - 2024-07-30 12:00:00
+
+### Bug Fix
+
+- Make `OGcorePlots.mplstyle` importable from the package by adding it to `setup.py`
+
+## [0.11.14] - 2024-07-30 12:00:00
+
+### Added
+
+- Aesthetic updates to plotting functions in `parameter_plots.py` and `demographics.py`
+
+## [0.11.13] - 2024-07-28 12:00:00
+
+### Added
+
+- Added three new pension types to the model: (i) defined benefits system, (ii) notional defined contribution system, and (iii) points system.
+
+## [0.11.12] - 2024-07-26 01:00:00
+
+### Bug Fix
+
+- Fixes extrapolation of nested lists of tax function parameters.
+
+## [0.11.11] - 2024-06-24 01:00:00
+
+### Added
+
+- Add new parameters for resource constraint tolerances for steady state and time path solution.
+
+## [0.11.10] - 2024-06-17 01:00:00
+
+### Added
+
+- Add HSV to list of valid tax functions in `default_parameters.json`
+
+
+## [0.11.9] - 2024-06-12 01:00:00
+
+### Added
+
+- Update `demographics.py` in the case input prompt not work.
+- Add new utility to dump the parameters to a JSON file
+
+
+## [0.11.8] - 2024-06-09 01:00:00
+
+### Added
+
+- Updates to `demographics.py` module to accept token for UN World Population Prospects database access or to download data from the [Population-Data](https://github.com/EAPD-DRB/Population-Data) repository.
+
+## [0.11.7] - 2024-06-07 01:00:00
+
+### Added
+
+- Heathcote, Storesletten, and Violante (2017) tax functions to `txfunc.py`
+
+## [0.11.6] - 2024-04-19 01:00:00
+
+### Added
+
+- Scatters parameters once in `TPI.py`
+- Removes Python 3.9 tests from `build_and_test.yml`
+
+
+## [0.11.5] - 2024-04-11 12:00:00
+
+### Added
+
+- Adds a list of file change event triggers to `build_and_test.yml` so that those tests only run when one of those files is changed.
+- Updates the codecov GH Action to version 4 and adds a secret token.
+- Adds a list of file change event triggers to `deploy_docs.yml` and `docs_check.yml`, and limits `docs_check.yml` to only run on pull requests.
+
+
+## [0.11.4] - 2024-04-03 22:00:00
+
+### Added
+
+- Add a function to `utils.py` to shift lifetime profiles of parameters
+- Add a function to `utils.py` to compute percentage changes in non-stationary variables
+- Add more functionality to `parameters_plots.py`, allowing the user to plot parameters from multiple parameters objects together
+
+
+## [0.11.3] - 2024-03-08 12:00:00
+
+### Added
+
+- Allow for `demographics.py` to save downloaded data directly.
+- Retrieve population data from the UN World Population Prospects database through CSV rather than JSON to avoid rate limit errors.
+
+
+## [0.11.2] - 2024-02-17 12:00:00
+
+### Added
+
+- Updates `demographics.py` with more functionality across the time path.
+- Allow the user to have the population distribution from the initial period forward inferred from given fertility, mortality, and immigration rates (functionality to infer immigration from a given evolution of the population is retained, the user specifies what they want to do via arguments to the relevant function calls).
+- Extends all series returned from the get_pop_objs() function over the full transition path of T+S periods (except those that apply only to a single period).
+- Addresses Issues #900 and #899
+
+
+## [0.11.1] - 2024-02-12 15:00:00
+
+### Added
+
+- Updated `setup.py` Python version requirement to be `python_requires=">=3.7.7, <3.12"`
+
+
+## [0.11.0] - 2024-02-06 15:00:00
+
+### Added
+
+- Allow `chi_n` parameter to vary over the time path (PR #897)
+- Create a demographics module in OG-Core (PR #896)
+- Create a time varying ability matrix (PR # 895)
+- Simplify the extrapolation of arrays over the time path (PR #891)
+- Update the copyright year of documentation to 2024
+
+
+## [0.10.10] - 2023-10-25 17:00:00
+
+### Added
+
+- Remove `surve_rate` parameter (PR #886)
+- Updates to `plot_2D_taxfunc` (PR #881)
+
+
+## [0.10.9] - 2023-09-08 12:00:00
+
+### Added
+
+- PR #880 standardize the time path output length
+- PR #878 fix tax function indexing, dimensions, and plotting. This PR also enables Python 3.11.
+- PR #875 remove unused dependency
+
+
+## [0.10.8] - 2023-04-22 12:00:00
+
+### Added
+
+- Adds a 2D monotonic smoothing spline tax function estimation to `txfunc.py`
+- Changes the tax function parameters objects from NumPy arrays to lists in order to accomodate the nonparametric functions that get passed with the `mono` and `mono2D` options
+
+
+## [0.10.7] - 2023-03-31 12:00:00
+
+### Added
+
+- Uses lists to pass and access effective tax rate objects `etr_params` and marginal tax rate objects `mtrx_params` and `mtry_params`
+
+
+## [0.10.6] - 2023-02-15 12:00:00
+
+### Added
+
+- Uses 300 dpi when saving plots to disk
+- Better labels of the `plot_industry_aggregates` plots
+
+
+## [0.10.5] - 2023-02-14 12:00:00
+
+### Added
+
+- Fix to `SS.py` to use baseline solution on reform run if dimensions match
+- Fix to `test_basic.py` dimensions for `r_gov_scale`
+
+
+## [0.10.4] - 2023-02-06 12:00:00
+
+### Added
+
+- New calibration section to documentation (PR #850)
+- Allow government risk premia to vary across time path for parameters `r_gov_shift` and `r_gov_scale` (PR #852)
+
+
+## [0.10.3] - 2023-01-21 12:00:00
+
+### Added
+
+- Bug fixes for new tax function parameter estimation
+
+
+## [0.10.2] - 2023-01-12 12:00:00
+
+### Added
+
+- Adds a new minimum value to the `r_gov_shift` parameter of -0.3
+
+
+## [0.10.1] - 2023-01-05 12:00:00
+
+### Added
+
+- Removes hard coded year label in parameter_plots.plot_population_path() (PR #825)
+- Fixes documentation (PR # 827)
+- Adds "mono" specification to default_parameter.json and test_parameters.py (PR #830)
+- Restricts Python version to be < 3.11 and removes the mkl dependency in environment.yml and setup.py (PR #833 and #840)
+- Updates CI testing to include Mac, Windows, and Linux operating systems and Python 3.9 and 3.10, and solves some CI test issues (PR #836)
+- Increases the maximum values for r_gov_shift and r_gov_scale in default_parameters.json (PR #838)
+- Removes the mkl dependency from environment.yml and setup.py (PR #840)
+
+
+## [0.10.0] - 2022-09-27 12:00:00
+
+### Added
+
+- Adds matrix of tax noncompliance parameters to households (PR #816)
+- Incorporate input/output matrix mapping production goods to consumption goods (PR #818)
+- Adds a new monotonic tax function estimation method to txfunc.py (PR #819)
+
+
+## [0.9.2] - 2022-08-21 12:00:00
+
+### Added
+
+- Updates the form of the investments tax credit to be on a proxy for investment (depreciated capital) in order to satisfy theoretical requirements of static firms in each industry.
+- Update the documentation
+- Update the requirement for the m_wealth parameter in the wealth tax function to be strictly greater than zero.
+
+
+## [0.9.1] - 2022-07-22 12:00:00
+
+### Added
+
+- Adds an investment tax credit parameter to the model
+- Adds a boolean that allows the option to compute a reform using a stored baseline solution rather than recomputing the baseline
+
+
+## [0.9.0] - 2022-06-30 12:00:00
+
+### Added
+
+- Adds multiple production industries to the model
+
+
+## [0.8.2] - 2022-06-01 12:00:00
+
+### Added
+
+- Formatting of source code with black
+- Last tag before extension of model to include multiple industries
+
+
+## [0.8.1] - 2022-04-01 12:00:00
+
+### Added
+
+- Updates PyPI.org packaging setup and includes auto-publishing GH Action (PRs #790, #795, and #797)
+- Cleans up documentation issues and old erroneous references to ogusa package (PR #797)
+
+
+## [0.8.0] - 2022-02-18 12:00:00
+
+### Added
+
+- Adds a public capital good (i.e., infrastructure) used to produce private goods and services
+- Adds a financial intermediary that links domestic and foreign savings to investment
+- Improves multiprocessing with Dask
+- Updates documentation
+- Moves testing files outside of the ogcore package source files directory
+- Tests functionality with Python 3.10.
+
+
+## [0.7.0] - 2021-08-30 12:00:00
+
+### Added
+
+- This is the first release of the OG-Core model (formerly the OG-USA model)
+
+
+## Previous versions
+
+### Summary
+
+- Version [0.7.0] on August 30, 2021 was the first time that the OG-USA repository was detached from all of the core model logic, which was named OG-Core. Before this version, OG-USA was part of what is now the [`OG-Core`](https://github.com/PSLmodels/OG-Core) repository. In the next version of OG-USA, we adjusted the version numbering to begin with 0.1.0. This initial version of 0.7.0, was sequential from what OG-USA used to be when the OG-Core project was called OG-USA.
+- Any earlier versions of OG-USA can be found in the [`OG-Core`](https://github.com/PSLmodels/OG-Core) repository [release history](https://github.com/PSLmodels/OG-Core/releases) from [v.0.6.4](https://github.com/PSLmodels/OG-Core/releases/tag/v0.6.4) (Jul. 20, 2021) or earlier.
+
+
+[0.24.4]: https://github.com/PSLmodels/OG-Core/compare/v0.24.3...v0.24.4
+[0.24.3]: https://github.com/PSLmodels/OG-Core/compare/v0.24.2...v0.24.3
+[0.24.2]: https://github.com/PSLmodels/OG-Core/compare/v0.24.1...v0.24.2
+[0.24.1]: https://github.com/PSLmodels/OG-Core/compare/v0.24.0...v0.24.1
+[0.24.0]: https://github.com/PSLmodels/OG-Core/compare/v0.23.1...v0.24.0
+[0.23.1]: https://github.com/PSLmodels/OG-Core/compare/v0.23.0...v0.23.1
+[0.23.0]: https://github.com/PSLmodels/OG-Core/compare/v0.22.0...v0.23.0
+[0.22.0]: https://github.com/PSLmodels/OG-Core/compare/v0.21.2...v0.22.0
+[0.21.2]: https://github.com/PSLmodels/OG-Core/compare/v0.21.1...v0.21.2
+[0.21.1]: https://github.com/PSLmodels/OG-Core/compare/v0.21.0...v0.21.1
+[0.21.0]: https://github.com/PSLmodels/OG-Core/compare/v0.20.4...v0.21.0
+[0.20.4]: https://github.com/PSLmodels/OG-Core/compare/v0.20.3...v0.20.4
+[0.20.3]: https://github.com/PSLmodels/OG-Core/compare/v0.20.2...v0.20.3
+[0.20.2]: https://github.com/PSLmodels/OG-Core/compare/v0.20.1...v0.20.2
+[0.20.1]: https://github.com/PSLmodels/OG-Core/compare/v0.20.0...v0.20.1
+[0.20.0]: https://github.com/PSLmodels/OG-Core/compare/v0.19.2...v0.20.0
+[0.19.2]: https://github.com/PSLmodels/OG-Core/compare/v0.19.1...v0.19.2
+[0.19.1]: https://github.com/PSLmodels/OG-Core/compare/v0.19.0...v0.19.1
+[0.19.0]: https://github.com/PSLmodels/OG-Core/compare/v0.18.1...v0.19.0
+[0.18.1]: https://github.com/PSLmodels/OG-Core/compare/v0.18.0...v0.18.1
+[0.18.0]: https://github.com/PSLmodels/OG-Core/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/PSLmodels/OG-Core/compare/v0.16.4...v0.17.0
+[0.16.4]: https://github.com/PSLmodels/OG-Core/compare/v0.16.3...v0.16.4
+[0.16.3]: https://github.com/PSLmodels/OG-Core/compare/v0.16.2...v0.16.3
+[0.16.2]: https://github.com/PSLmodels/OG-Core/compare/v0.16.1...v0.16.2
+[0.16.1]: https://github.com/PSLmodels/OG-Core/compare/v0.16.0...v0.16.1
+[0.16.0]: https://github.com/PSLmodels/OG-Core/compare/v0.15.13...v0.16.0
+[0.15.13]: https://github.com/PSLmodels/OG-Core/compare/v0.15.12...v0.15.13
+[0.15.12]: https://github.com/PSLmodels/OG-Core/compare/v0.15.11...v0.15.12
+[0.15.11]: https://github.com/PSLmodels/OG-Core/compare/v0.15.10...v0.15.11
+[0.15.10]: https://github.com/PSLmodels/OG-Core/compare/v0.15.9...v0.15.10
+[0.15.9]: https://github.com/PSLmodels/OG-Core/compare/v0.15.8...v0.15.9
+[0.15.8]: https://github.com/PSLmodels/OG-Core/compare/v0.15.7...v0.15.8
+[0.15.7]: https://github.com/PSLmodels/OG-Core/compare/v0.15.6...v0.15.7
+[0.15.6]: https://github.com/PSLmodels/OG-Core/compare/v0.15.5...v0.15.6
+[0.15.5]: https://github.com/PSLmodels/OG-Core/compare/v0.15.4...v0.15.5
+[0.15.4]: https://github.com/PSLmodels/OG-Core/compare/v0.15.3...v0.15.4
+[0.15.3]: https://github.com/PSLmodels/OG-Core/compare/v0.15.2...v0.15.3
+[0.15.2]: https://github.com/PSLmodels/OG-Core/compare/v0.15.1...v0.15.2
+[0.15.1]: https://github.com/PSLmodels/OG-Core/compare/v0.15.0...v0.15.1
+[0.15.0]: https://github.com/PSLmodels/OG-Core/compare/v0.14.14...v0.15.0
+[0.14.14]: https://github.com/PSLmodels/OG-Core/compare/v0.14.13...v0.14.14
+[0.14.13]: https://github.com/PSLmodels/OG-Core/compare/v0.14.12...v0.14.13
+[0.14.12]: https://github.com/PSLmodels/OG-Core/compare/v0.14.11...v0.14.12
+[0.14.11]: https://github.com/PSLmodels/OG-Core/compare/v0.14.10...v0.14.11
+[0.14.10]: https://github.com/PSLmodels/OG-Core/compare/v0.14.9...v0.14.10
+[0.14.9]: https://github.com/PSLmodels/OG-Core/compare/v0.14.8...v0.14.9
+[0.14.8]: https://github.com/PSLmodels/OG-Core/compare/v0.14.7...v0.14.8
+[0.14.7]: https://github.com/PSLmodels/OG-Core/compare/v0.14.6...v0.14.7
+[0.14.6]: https://github.com/PSLmodels/OG-Core/compare/v0.14.5...v0.14.6
+[0.14.5]: https://github.com/PSLmodels/OG-Core/compare/v0.14.4...v0.14.5
+[0.14.4]: https://github.com/PSLmodels/OG-Core/compare/v0.14.3...v0.14.4
+[0.14.3]: https://github.com/PSLmodels/OG-Core/compare/v0.14.2...v0.14.3
+[0.14.2]: https://github.com/PSLmodels/OG-Core/compare/v0.14.1...v0.14.2
+[0.14.1]: https://github.com/PSLmodels/OG-Core/compare/v0.14.0...v0.14.1
+[0.14.0]: https://github.com/PSLmodels/OG-Core/compare/v0.13.2...v0.14.0
+[0.13.2]: https://github.com/PSLmodels/OG-Core/compare/v0.13.1...v0.13.2
+[0.13.1]: https://github.com/PSLmodels/OG-Core/compare/v0.13.0...v0.13.1
+[0.13.0]: https://github.com/PSLmodels/OG-Core/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/PSLmodels/OG-Core/compare/v0.11.17...v0.12.0
+[0.11.17]: https://github.com/PSLmodels/OG-Core/compare/v0.11.16...v0.11.17
+[0.11.16]: https://github.com/PSLmodels/OG-Core/compare/v0.11.15...v0.11.16
+[0.11.15]: https://github.com/PSLmodels/OG-Core/compare/v0.11.14...v0.11.15
+[0.11.14]: https://github.com/PSLmodels/OG-Core/compare/v0.11.13...v0.11.14
+[0.11.13]: https://github.com/PSLmodels/OG-Core/compare/v0.11.11...v0.11.13
+[0.11.11]: https://github.com/PSLmodels/OG-Core/compare/v0.11.10...v0.11.11
+[0.11.10]: https://github.com/PSLmodels/OG-Core/compare/v0.11.9...v0.11.10
+[0.11.9]: https://github.com/PSLmodels/OG-Core/compare/v0.11.8...v0.11.9
+[0.11.8]: https://github.com/PSLmodels/OG-Core/compare/v0.11.7...v0.11.8
+[0.11.7]: https://github.com/PSLmodels/OG-Core/compare/v0.11.6...v0.11.7
+[0.11.6]: https://github.com/PSLmodels/OG-Core/compare/v0.11.5...v0.11.6
+[0.11.5]: https://github.com/PSLmodels/OG-Core/compare/v0.11.4...v0.11.5
+[0.11.4]: https://github.com/PSLmodels/OG-Core/compare/v0.11.3...v0.11.4
+[0.11.3]: https://github.com/PSLmodels/OG-Core/compare/v0.11.2...v0.11.3
+[0.11.2]: https://github.com/PSLmodels/OG-Core/compare/v0.11.1...v0.11.2
+[0.11.1]: https://github.com/PSLmodels/OG-Core/compare/v0.11.0...v0.11.1
+[0.11.0]: https://github.com/PSLmodels/OG-Core/compare/v0.10.10...v0.11.0
+[0.10.10]: https://github.com/PSLmodels/OG-Core/compare/v0.10.9...v0.10.10
+[0.10.9]: https://github.com/PSLmodels/OG-Core/compare/v0.10.8...v0.10.9
+[0.10.8]: https://github.com/PSLmodels/OG-Core/compare/v0.10.7...v0.10.8
+[0.10.7]: https://github.com/PSLmodels/OG-Core/compare/v0.10.6...v0.10.7
+[0.10.6]: https://github.com/PSLmodels/OG-Core/compare/v0.10.5...v0.10.6
+[0.10.5]: https://github.com/PSLmodels/OG-Core/compare/v0.10.4...v0.10.5
+[0.10.4]: https://github.com/PSLmodels/OG-Core/compare/v0.10.3...v0.10.4
+[0.10.3]: https://github.com/PSLmodels/OG-Core/compare/v0.10.2...v0.10.3
+[0.10.2]: https://github.com/PSLmodels/OG-Core/compare/v0.10.1...v0.10.2
+[0.10.1]: https://github.com/PSLmodels/OG-Core/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/PSLmodels/OG-Core/compare/v0.9.2...v0.10.0
+[0.9.2]: https://github.com/PSLmodels/OG-Core/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/PSLmodels/OG-Core/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/PSLmodels/OG-Core/compare/v0.8.2...v0.9.0
+[0.8.2]: https://github.com/PSLmodels/OG-Core/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/PSLmodels/OG-Core/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/PSLmodels/OG-Core/compare/v0.7.0...v0.8.0

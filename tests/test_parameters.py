@@ -1,0 +1,709 @@
+import os
+import json
+import tempfile
+import pytest
+import numpy as np
+from ogcore.parameters import Specifications, revision_warnings_errors
+
+# get path to puf if puf.csv in ogcore/ directory
+CUR_PATH = os.path.abspath(os.path.dirname(__file__))
+
+JSON_REVISION_FILE = """{
+    "revision": {
+        "frisch": 0.3
+    }
+}"""
+
+
+@pytest.fixture(scope="module")
+def revision_file():
+    f = tempfile.NamedTemporaryFile(mode="a", delete=False)
+    f.write(JSON_REVISION_FILE)
+    f.close()
+    # Must close and then yield for Windows platform
+    yield f
+    os.remove(f.name)
+
+
+def test_create_specs_object():
+    specs = Specifications()
+    assert specs
+
+
+def test_compute_default_params():
+    specs = Specifications()
+    specs.alpha_G = np.ones((10, 1))
+    specs.compute_default_params()
+    assert specs.alpha_G[10] == 1
+
+
+def test_initial_wealth_parameters_default_to_none():
+    """
+    The optional initial wealth parameters are None unless set, round-trip
+    through update_specifications, and a supplied distribution must be
+    S x J and sum to one.
+    """
+    specs = Specifications()
+    assert specs.initial_wealth_ratio is None
+    assert specs.initial_hhwealth_dist is None
+    specs.update_specifications({"initial_wealth_ratio": 3.0})
+    assert specs.initial_wealth_ratio == 3.0
+    specs.update_specifications({"initial_wealth_ratio": None})
+    assert specs.initial_wealth_ratio is None
+    dist = np.ones((specs.S, specs.J)) / (specs.S * specs.J)
+    specs.update_specifications({"initial_hhwealth_dist": dist.tolist()})
+    assert specs.initial_hhwealth_dist.shape == (specs.S, specs.J)
+    assert np.isclose(specs.initial_hhwealth_dist.sum(), 1.0)
+    specs.update_specifications({"initial_hhwealth_dist": None})
+    assert specs.initial_hhwealth_dist is None
+    with pytest.raises(ValueError, match="sum to one"):
+        specs.update_specifications(
+            {"initial_hhwealth_dist": (2 * dist).tolist()}
+        )
+    with pytest.raises(ValueError, match="shape"):
+        specs.update_specifications(
+            {"initial_hhwealth_dist": dist[:-1, :].tolist()}
+        )
+
+
+def test_alpha_FA_extended_over_time_path():
+    # alpha_FA is a GDP-share fiscal parameter that may vary over the time
+    # path, so it should be extrapolated to length T+S with the last value
+    # carried forward (like alpha_G/alpha_T/alpha_I).  A multi-element path
+    # previously stayed short and broke the TPI fiscal calculations when
+    # broadcast against Y[:T].
+    specs = Specifications()
+    specs.alpha_FA = np.array([0.01, 0.02, 0.03])
+    specs.compute_default_params()
+    assert specs.alpha_FA.shape[0] == specs.T + specs.S
+    assert specs.alpha_FA[0] == 0.01
+    assert specs.alpha_FA[2] == 0.03
+    # periods beyond the entered path take the last value entered
+    assert specs.alpha_FA[specs.T] == 0.03
+    assert specs.alpha_FA[-1] == 0.03
+
+
+def test_tau_payroll_extended_over_T_and_J():
+    # tau_payroll may vary over the time path and across lifetime income
+    # groups, so it should be extrapolated to T+S x J from a scalar, a
+    # vector of length J, or a (partial) time path.
+    specs = Specifications()
+    assert specs.tau_payroll.shape == (specs.T + specs.S, specs.J)
+    assert np.all(specs.tau_payroll == 0.0)
+    # single value applies to all groups and periods
+    specs.update_specifications({"tau_payroll": [[0.1]]})
+    assert specs.tau_payroll.shape == (specs.T + specs.S, specs.J)
+    assert np.allclose(specs.tau_payroll, 0.1)
+    # one value per income group, constant over time
+    by_J = [[0.01 * (j + 1) for j in range(specs.J)]]
+    specs.update_specifications({"tau_payroll": by_J})
+    assert specs.tau_payroll.shape == (specs.T + specs.S, specs.J)
+    assert np.allclose(specs.tau_payroll[0, :], by_J[0])
+    assert np.allclose(specs.tau_payroll[-1, :], by_J[0])
+    # time path common across groups, last value carried forward
+    specs.update_specifications({"tau_payroll": [[0.1], [0.2], [0.3]]})
+    assert specs.tau_payroll.shape == (specs.T + specs.S, specs.J)
+    assert np.allclose(specs.tau_payroll[:3, 0], [0.1, 0.2, 0.3])
+    assert np.allclose(specs.tau_payroll[3:, :], 0.3)
+    assert np.allclose(specs.tau_payroll[1, :], 0.2)
+
+
+def test_TxJ_params_collapse_when_J_changes():
+    # A previously extrapolated T+S x J array that is uniform across J
+    # should be re-extrapolated to the new J when J is changed, rather
+    # than raising an error, so the T x J parameters need not be
+    # re-specified when changing J (the T x S x J demographic and
+    # ability parameters still must be).
+    specs = Specifications()
+    specs.update_specifications({"tau_payroll": [[0.1]]})
+    assert specs.tau_payroll.shape[1] == 7
+    rho_vec = np.zeros((1, 20))
+    rho_vec[0, -1] = 1.0
+    new_J_params = {
+        "T": 30,
+        "S": 20,
+        "J": 2,
+        "chi_n": np.ones(2),
+        "e": np.ones((20, 2)),
+        "eta": (np.ones((20, 2)) / (20 * 2)),
+        "lambdas": [0.6, 0.4],
+        "omega": (np.ones((30, 20)) / 20).reshape(30, 20, 1)
+        * np.array([0.6, 0.4]).tolist(),
+        "omega_SS": (np.ones(20) / 20).reshape(20, 1)
+        * np.array([0.6, 0.4]).tolist(),
+        "omega_S_preTP": (np.ones(20) / 20).reshape(20, 1)
+        * np.array([0.6, 0.4]).tolist(),
+        "imm_rates": np.zeros((30, 20, 2)).tolist(),
+        "imm_rates_preTP": np.zeros((20, 2)).tolist(),
+        "rho": np.tile(rho_vec.reshape(1, 20, 1), (30, 1, 2)).tolist(),
+        "rho_preTP": np.tile(rho_vec.reshape(20, 1), (1, 2)).tolist(),
+    }
+    specs.update_specifications(new_J_params)
+    for item in [
+        "tau_payroll",
+        "labor_income_tax_noncompliance_rate",
+        "capital_income_tax_noncompliance_rate",
+        "replacement_rate_adjust",
+        "income_tax_filer",
+        "wealth_tax_filer",
+    ]:
+        assert getattr(specs, item).shape == (specs.T + specs.S, 2), item
+    assert np.allclose(specs.tau_payroll, 0.1)
+
+
+rho_array = np.zeros((4, 3, 7))
+rho_array[:, -1, :] = 1.0
+param_updates1 = {
+    "T": 4,
+    "S": 3,
+    "rho": rho_array.tolist(),
+    "e": np.ones((3, 7)),
+    "ubi_nom_017": 1000,
+    "ubi_nom_1864": 1200,
+    "ubi_nom_65p": 400,
+    "ubi_growthadj": True,
+}
+expected1 = np.ones((7, 3, 7)) * 2180
+param_updates2 = {
+    "T": 4,
+    "S": 3,
+    "rho": rho_array.tolist(),
+    "e": np.ones((3, 7)),
+    "ubi_nom_017": 1000,
+    "ubi_nom_1864": 1200,
+    "ubi_nom_max": 2000,
+    "ubi_nom_65p": 400,
+    "ubi_growthadj": True,
+}
+expected2 = np.ones((7, 3, 7)) * 2000
+param_updates3 = {
+    "T": 4,
+    "S": 3,
+    "rho": rho_array.tolist(),
+    "e": np.ones((3, 7)),
+    "ubi_nom_017": 1000,
+    "ubi_nom_1864": 1200,
+    "ubi_nom_65p": 400,
+    "ubi_growthadj": False,
+    "g_y_annual": 0.03,
+}
+expected3 = np.array(
+    [
+        [[2180], [2180.0], [2180.0]],
+        [[656.9250257], [656.9250257], [656.9250257]],
+        [[197.9589401], [197.9589401], [197.9589401]],
+        [[59.65329442], [59.65329442], [59.65329442]],
+        [[17.97602843], [17.97602843], [17.97602843]],
+        [[17.97602843], [17.97602843], [17.97602843]],
+        [[17.97602843], [17.97602843], [17.97602843]],
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "param_updates, expected",
+    [
+        (param_updates1, expected1),
+        (param_updates2, expected2),
+        (param_updates3, expected3),
+    ],
+    ids=["UBI growth adj", "UBI hit max", "UBI no growth adj"],
+)
+def test_get_ubi_nom_objs(param_updates, expected):
+    spec = Specifications()
+    spec.update_specifications(param_updates)
+    assert np.allclose(spec.ubi_nom_array, expected)
+
+
+def test_update_specifications_with_dict():
+    spec = Specifications()
+    new_spec_dict = {
+        "frisch": 0.3,
+    }
+    spec.update_specifications(new_spec_dict)
+    assert spec.frisch == 0.3
+    assert len(spec.errors) == 0
+
+
+def test_update_specification_with_json():
+    spec = Specifications()
+    new_spec_json = """
+        {
+            "frisch": 0.3
+        }
+    """
+    spec.update_specifications(new_spec_json)
+    assert spec.frisch == 0.3
+    assert len(spec.errors) == 0
+
+
+def test_implement_reform():
+    specs = Specifications()
+    new_specs = {"tG1": 30, "T": 80, "frisch": 0.3, "tax_func_type": "DEP"}
+
+    specs.update_specifications(new_specs)
+    assert specs.frisch == 0.3
+    assert specs.tG1 == 30
+    assert specs.T == 80
+    assert specs.tax_func_type == "DEP"
+    assert len(specs.errors) == 0
+    # assert len(specs.warnings) == 0
+
+
+def test_implement_bad_reform1():
+    specs = Specifications()
+    # tG1 has an upper bound at T / 2
+    new_specs = {
+        "tG1": 50,
+        "T": 80,
+    }
+
+    specs.update_specifications(new_specs, raise_errors=False)
+
+    assert len(specs.errors) == 0
+
+
+def test_implement_bad_reform2():
+    specs = Specifications()
+    # tG1 has an upper bound at T / 2
+    new_specs = {"T": 80, "tax_func_type": "not_a_functional_form"}
+
+    specs.update_specifications(new_specs, raise_errors=False)
+
+    assert len(specs.errors) > 0
+    assert specs.errors["tax_func_type"][0] == (
+        'tax_func_type "not_a_functional_form" must be in list of '
+        + "choices DEP, DEP_totalinc, GS, HSV, linear, mono, mono2D."
+    )
+
+
+def test_implement_bad_reform3():
+    specs = Specifications()
+    with pytest.raises(ValueError):
+        specs.update_specifications(None, raise_errors=False)
+
+
+def test_revision_warnings_errors():
+    user_mods = {"frisch": 0.41}
+
+    ew = revision_warnings_errors(user_mods)
+    assert len(ew["errors"]) == 0
+    assert len(ew["warnings"]) == 0
+
+    user_mods = {"frisch": 0.1}
+
+    bad_ew = revision_warnings_errors(user_mods)
+    assert len(bad_ew["errors"]) > 0
+    assert len(bad_ew["warnings"]) == 0
+
+
+def test_conditional_validator():
+    specs = Specifications()
+    new_specs = {"budget_balance": True, "baseline_spending": True}
+    specs.update_specifications(new_specs, raise_errors=False)
+    assert len(specs.errors) > 0
+
+
+def test_expand_taxfunc_params():
+    specs = Specifications()
+    new_specs = {"etr_params": [[[0.35]]]}
+    specs.update_specifications(new_specs)
+    assert len(specs.etr_params) == specs.T + specs.S
+    assert len(specs.etr_params[0]) == specs.S
+    assert specs.etr_params[0][0][0] == 0.35
+
+
+def test_J_dimensioned_length_guard():
+    """beta_annual / chi_b must have 1 or J values; see issue #1146.
+
+    Wrong-length vectors used to flow through silently: a short one crashed
+    much later (IndexError deep in the SS solve) and a long one was silently
+    truncated to the first J entries.
+    """
+    # one value broadcasts to all J groups
+    specs = Specifications()
+    specs.update_specifications({"beta_annual": [0.95], "chi_b": [50.0]})
+    assert specs.beta.shape == (specs.J,)
+    assert specs.chi_b.shape == (specs.J,)
+    assert np.allclose(specs.chi_b, 50.0)
+
+    # a uniform vector of the wrong length is reshaped losslessly
+    specs2 = Specifications()
+    specs2.update_specifications({"beta_annual": [0.96, 0.96, 0.96]})
+    assert specs2.beta.shape == (specs2.J,)
+
+    # a non-uniform vector of the wrong length raises immediately
+    specs3 = Specifications()
+    with pytest.raises(ValueError, match="beta_annual"):
+        specs3.update_specifications({"beta_annual": [0.94, 0.95, 0.96]})
+
+
+def test_retire_is_a_period_by_age_array():
+    """
+    retire is a (T + S) x S array of the retirement period for the
+    household of age s in period t. With no pension regimes every entry
+    is the base retirement age. retirement_age itself is a single value;
+    a uniform list collapses and a year-varying list is an error that
+    points at pension_regimes.
+    """
+    p = Specifications()
+    assert p.retire.shape == (p.T + p.S, p.S)
+    assert p.retire.dtype.kind == "i"
+    assert np.all(p.retire == 44)  # age 65 with starting_age 20
+    assert p.retirement_age.shape == (1,)
+    assert p.pension_regimes == []
+
+    p.update_specifications({"retirement_age": [67, 67]})
+    assert p.retirement_age.shape == (1,)
+    assert np.all(p.retire == 46)
+
+    with pytest.raises(ValueError, match="pension_regimes"):
+        Specifications().update_specifications({"retirement_age": [65, 67]})
+
+
+def test_pension_regime_calendar_only():
+    """A regime with no cohort cutoff applies to everyone from its year."""
+    p = Specifications()
+    p.update_specifications(
+        {"pension_regimes": [{"year": 2030, "retirement_age": 60}]}
+    )
+    t_switch = 2030 - p.start_year
+    assert np.all(p.retire[:t_switch, :] == 44)
+    assert np.all(p.retire[t_switch:, :] == 39)
+
+
+def test_pension_regime_grandfathered():
+    """
+    A regime with max_age_at_start applies only to households at or
+    below that age in its start year, in that year and every later one,
+    so each cohort keeps one retirement age down its diagonal.
+    """
+    p = Specifications()
+    p.update_specifications(
+        {
+            "pension_regimes": [
+                {"year": 2030, "max_age_at_start": 54, "retirement_age": 67}
+            ]
+        }
+    )
+    base, raised = 44, 46
+    E = p.starting_age
+    # before 2030 nothing changes
+    assert np.all(p.retire[: 2030 - p.start_year, :] == base)
+    # in 2030 ages up to 54 move, 55 and over stay
+    t = 2030 - p.start_year
+    assert np.all(p.retire[t, : 54 - E + 1] == raised)
+    assert np.all(p.retire[t, 55 - E :] == base)
+    # in 2045 the cutoff cohort is 69
+    t = 2045 - p.start_year
+    assert np.all(p.retire[t, : 69 - E + 1] == raised)
+    assert np.all(p.retire[t, 70 - E :] == base)
+    # the steady state is in the new regime
+    assert np.all(p.retire[-1, :] == raised)
+    # cohort diagonals: aged 40 in 2030 (35 in 2025) switches in 2030,
+    # aged 60 in 2030 never does, born in 2032 always has the new age
+    forty = np.diagonal(p.retire, offset=35 - E)
+    assert np.all(forty[:5] == base) and np.all(forty[5:] == raised)
+    sixty = np.diagonal(p.retire, offset=55 - E)
+    assert np.all(sixty == base)
+    born_2032 = np.diagonal(p.retire[7 : 7 + p.S, :])
+    assert np.all(born_2032 == raised)
+
+
+def test_pension_regime_birth_year_form():
+    """
+    A regime dated before start_year with max_age_at_start 0 is a
+    birth-year cutoff: year 1980 covers everyone born in 1980 or later.
+    """
+    p = Specifications()
+    p.update_specifications(
+        {
+            "pension_regimes": [
+                {"year": 1980, "max_age_at_start": 0, "retirement_age": 67}
+            ]
+        }
+    )
+    E = p.starting_age
+    # in 2025 those born in 1980 are 45
+    assert np.all(p.retire[0, : 45 - E + 1] == 46)
+    assert np.all(p.retire[0, 46 - E :] == 44)
+
+
+def test_pension_regimes_apply_in_list_order():
+    """
+    Later regimes overwrite earlier ones where both apply, so a phased
+    schedule lists the narrower (younger) cutoffs last.
+    """
+    schedule = [
+        {"year": 2030, "max_age_at_start": 54, "retirement_age": 67},
+        {"year": 2030, "max_age_at_start": 44, "retirement_age": 68},
+    ]
+    p = Specifications()
+    p.update_specifications({"pension_regimes": schedule})
+    E = p.starting_age
+    t = 2030 - p.start_year
+    assert p.retire[t, 44 - E] == 47
+    assert p.retire[t, 45 - E] == 46
+    assert p.retire[t, 55 - E] == 44
+
+    reversed_schedule = list(reversed(schedule))
+    q = Specifications()
+    q.update_specifications({"pension_regimes": reversed_schedule})
+    # the 67 regime now comes last and covers the under-45s too
+    assert q.retire[t, 44 - E] == 46
+    assert q.retire[t, 45 - E] == 46
+
+
+def test_pension_regime_with_fewer_periods_than_years():
+    """
+    With S = 40 each model period spans two years, so the calendar
+    year of period t is start_year + 2t and ages run 20, 22, ...
+    """
+    with open(os.path.join(CUR_PATH, "testing_params.json")) as f:
+        small = json.load(f)
+    p = Specifications()
+    small["pension_regimes"] = [
+        {"year": 2030, "max_age_at_start": 54, "retirement_age": 67}
+    ]
+    p.update_specifications(small)
+    assert p.S == 40
+    assert p.retire.shape == (p.T + p.S, p.S)
+    base = int(np.round((65 - p.starting_age) * 40 / 80.0) - 1)
+    raised = int(np.round((67 - p.starting_age) * 40 / 80.0) - 1)
+    assert raised > base
+    # 2029 (t = 2) is before the regime, 2031 (t = 3) is after
+    assert np.all(p.retire[2, :] == base)
+    # at t = 3, age 20 + 2s, age in 2030 = 20 + 2s - 6 + 5 <= 54 means
+    # s <= 17
+    assert np.all(p.retire[3, :18] == raised)
+    assert np.all(p.retire[3, 18:] == base)
+
+
+@pytest.mark.parametrize(
+    "regimes,match",
+    [
+        ("not a list", "list of dicts"),
+        ([{"year": 2030, "retirement_age": 67, "foo": 1}], "unknown keys"),
+        ([{"retirement_age": 67}], "missing the required 'year'"),
+        ([{"year": 2030.5, "retirement_age": 67}], "integer calendar year"),
+        ([{"year": 9999, "retirement_age": 67}], "after the end"),
+        ([{"year": 2030}], "sets none of the pension parameters"),
+        ([{"year": 2030, "retirement_age": [67]}], "single number"),
+        ([{"year": 2030, "retirement_age": 120}], "above the maximum"),
+        (
+            [{"year": 2030, "max_age_at_start": -1, "retirement_age": 67}],
+            "max_age_at_start",
+        ),
+        (
+            # everyone at or below 70 in 2030 includes households already
+            # retired at 65, whose benefits would stop
+            [{"year": 2030, "max_age_at_start": 70, "retirement_age": 67}],
+            "after it has retired",
+        ),
+        (
+            # a cutoff so late that the final period still has cohorts
+            # on the old age
+            [{"year": 2423, "max_age_at_start": 54, "retirement_age": 67}],
+            "spans more than one pension regime",
+        ),
+        ([{"year": 2030, "retirement_age": 101}], "above the maximum"),
+        ([{"year": 2030, "retirement_age": 18}], "inside the working life"),
+    ],
+    ids=[
+        "not a list",
+        "unknown key",
+        "missing year",
+        "non-integer year",
+        "year past path",
+        "no parameters",
+        "list value",
+        "out of range",
+        "negative age",
+        "raises age of retirees",
+        "steady state split",
+        "above validator max",
+        "retire before working life",
+    ],
+)
+def test_pension_regimes_validation(regimes, match):
+    p = Specifications()
+    with pytest.raises(ValueError, match=match):
+        p.update_specifications({"pension_regimes": regimes})
+
+
+def test_pension_regimes_lowering_age_for_retirees_is_allowed():
+    """
+    Lowering the retirement age for everyone, including households
+    already retired, withdraws no benefits and is accepted.
+    """
+    p = Specifications()
+    p.update_specifications(
+        {"pension_regimes": [{"year": 2030, "retirement_age": 62}]}
+    )
+    assert np.all(p.retire[-1, :] == 41)
+
+
+def test_pension_regimes_from_json_string_and_dict_left_intact():
+    """
+    pension_regimes can arrive in a JSON string, and a revision dict is
+    not modified by update_specifications.
+    """
+    revision = {
+        "pension_regimes": [{"year": 2030, "retirement_age": 60}],
+        "frisch": 0.5,
+    }
+    p = Specifications()
+    p.update_specifications(json.dumps(revision))
+    assert np.all(p.retire[-1, :] == 39)
+    assert p.frisch == 0.5
+
+    q = Specifications()
+    q.update_specifications(revision)
+    assert "pension_regimes" in revision
+    assert np.all(q.retire[-1, :] == 39)
+
+
+def test_pension_regimes_expand_db_and_ndc_parameters():
+    """
+    The DB and NDC parameters are expanded to arrays by period and age
+    (and lifetime income group for alpha_db), and a grandfathered regime
+    changes them only for the cohorts it covers. The regime sets some
+    parameters and leaves the others at their base values.
+    """
+    p = Specifications()
+    p.update_specifications(
+        {
+            "alpha_db": [[0.02]],
+            "tau_p": 0.1,
+            "pension_regimes": [
+                {
+                    "year": 2030,
+                    "max_age_at_start": 54,
+                    "alpha_db": 0.015,
+                    "avg_earn_num_years": 45,
+                    "tau_p": 0.12,
+                    "k_ret": 0.4,
+                }
+            ],
+        }
+    )
+    n_rows = p.T + p.S
+    for name in ["avg_earn_num_years", "yr_contrib", "tau_p", "k_ret", "indR"]:
+        assert np.asarray(getattr(p, name)).shape == (n_rows, p.S), name
+    assert p.alpha_db.shape == (n_rows, p.S, p.J)
+    assert p.retire.shape == (n_rows, p.S)
+    # the regime covers the same cells for every parameter it sets, so
+    # one mask describes them all; it is False before 2030 and True in
+    # the steady state
+    covered = p.tau_p == 0.12
+    assert not covered[: 2030 - p.start_year].any()
+    assert covered[-1].all()
+    assert np.array_equal(p.alpha_db[:, :, 0] == 0.015, covered)
+    assert np.array_equal(p.avg_earn_num_years == 45, covered)
+    assert np.array_equal(p.k_ret == 0.4, covered)
+    assert np.all(p.tau_p[~covered] == 0.1)
+    assert np.all(p.alpha_db[~covered] == 0.02)
+    assert np.all(p.avg_earn_num_years[~covered] == 35)
+    # untouched parameters keep their base values everywhere
+    assert np.all(p.yr_contrib == 40)
+    assert np.all(p.indR == 0.0)
+    assert np.all(p.retire == 44)
+    # the cutoff in 2030 is age 54: cohorts aged 40 in 2030 switch that
+    # year and never switch back, cohorts aged 60 never switch
+    E = p.starting_age
+    forty = np.diagonal(p.tau_p, offset=35 - E)
+    assert np.all(forty[:5] == 0.1) and np.all(forty[5:] == 0.12)
+    assert np.all(np.diagonal(p.tau_p, offset=55 - E) == 0.1)
+    # a second update that does not mention the regimes rebuilds the
+    # same arrays from the base values rather than layering on the
+    # expanded ones
+    p.update_specifications({"frisch": 0.5})
+    assert np.array_equal(p.tau_p == 0.12, covered)
+    assert np.all(p.tau_p[~covered] == 0.1)
+    # and dropping the regimes restores the base values
+    p.update_specifications({"pension_regimes": []})
+    assert np.all(p.tau_p == 0.1) and np.all(p.alpha_db == 0.02)
+
+
+def test_pension_regime_alpha_db_by_group_and_year_of_payment():
+    """
+    alpha_db keeps its base form, a path by calendar year of payment and
+    lifetime income group, and a regime overrides it by cohort with a
+    single number or one value per group.
+    """
+    p = Specifications()
+    J = p.J
+    base_rows = [[0.02] * J, [0.02] * J, [0.04] * J]
+    reform_vals = [0.01 + 0.001 * jj for jj in range(J)]
+    p.update_specifications(
+        {
+            "alpha_db": base_rows,
+            "pension_regimes": [
+                {
+                    "year": 2030,
+                    "max_age_at_start": 54,
+                    "alpha_db": reform_vals,
+                }
+            ],
+        }
+    )
+    assert p.alpha_db.shape == (p.T + p.S, p.S, J)
+    # year-of-payment base: the same at every age in a period
+    assert np.all(p.alpha_db[0] == 0.02)
+    assert np.all(p.alpha_db[1] == 0.02)
+    assert np.all(p.alpha_db[2] == 0.04)
+    assert np.all(p.alpha_db[4] == 0.04)  # extrapolated
+    # from 2030 the covered cohorts get the regime's values by group
+    # and the older cohorts keep the base path
+    t = 2030 - p.start_year
+    E = p.starting_age
+    assert np.allclose(p.alpha_db[t, : 54 - E + 1], reform_vals)
+    assert np.all(p.alpha_db[t, 55 - E :] == 0.04)
+    assert np.allclose(p.alpha_db[-1], reform_vals)
+
+
+def test_pension_regime_calendar_only_for_db_parameters():
+    """
+    With no max_age_at_start a regime applies to everyone from its
+    start year, current retirees included, so the arrays change by
+    row rather than by cohort.
+    """
+    p = Specifications()
+    p.update_specifications(
+        {
+            "pension_regimes": [
+                {"year": 2030, "alpha_db": 0.05, "yr_contrib": 30}
+            ]
+        }
+    )
+    t = 2030 - p.start_year
+    assert np.all(p.alpha_db[:t] == 0.0) and np.all(p.alpha_db[t:] == 0.05)
+    assert np.all(p.yr_contrib[:t] == 40) and np.all(p.yr_contrib[t:] == 30)
+
+
+@pytest.mark.parametrize(
+    "regimes,match",
+    [
+        ([{"year": 2030, "tau_p": 1.5}], "above the maximum"),
+        ([{"year": 2030, "alpha_db": [0.01, 0.02]}], "list of J"),
+        ([{"year": 2030, "alpha_db": "high"}], "list of J"),
+        ([{"year": 2030, "avg_earn_num_years": [30]}], "single number"),
+        ([{"year": 2030, "k_ret": -0.1}], "below the minimum"),
+        (
+            [{"year": 2423, "max_age_at_start": 54, "tau_p": 0.2}],
+            "single value of tau_p",
+        ),
+    ],
+    ids=[
+        "tau_p above max",
+        "alpha_db wrong length",
+        "alpha_db not numeric",
+        "list for scalar parameter",
+        "k_ret below min",
+        "steady state split on tau_p",
+    ],
+)
+def test_pension_regimes_validation_db_ndc(regimes, match):
+    p = Specifications()
+    with pytest.raises(ValueError, match=match):
+        p.update_specifications({"pension_regimes": regimes})

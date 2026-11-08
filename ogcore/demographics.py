@@ -1,0 +1,2010 @@
+"""
+Functions for generating demographic objects necessary for the OG-USA model. A
+list of UN official 3-digit country codes and corresponding 3-character country
+abbreviations is available at https://unstats.un.org/unsd/methodology/m49/
+"""
+
+# Import packages
+import os
+import sys
+import argparse
+import base64
+import datetime
+import getpass
+import json
+import numpy as np
+from io import StringIO
+import scipy.optimize as opt
+import pandas as pd
+from ogcore.utils import get_legacy_session
+from ogcore import parameter_plots as pp
+
+START_YEAR = 2024
+END_YEAR = 2024
+UN_COUNTRY_CODE = "840"  # UN code for USA
+UN_TOKEN_FILENAME = "un_api_token.txt"
+UN_TOKEN_URL = "https://population.un.org/dataportalapi/index.html"
+UN_DATA_ARCHIVE_URL = "https://github.com/EAPD-DRB/Population-Data"
+# Warn only once per session about a token found in the working directory
+_WARNED_LEGACY_UN_TOKEN = False
+# Say how to register a token only once per session, not on every request
+_HINTED_NO_UN_TOKEN = False
+# Say a token has expired only once per session
+_WARNED_EXPIRED_UN_TOKEN = False
+# create output director for figures
+CUR_PATH = os.path.split(os.path.abspath(__file__))[0]
+OUTPUT_DIR = os.path.join(CUR_PATH, "..", "data", "OUTPUT", "Demographics")
+if os.access(OUTPUT_DIR, os.F_OK) is False:
+    os.makedirs(OUTPUT_DIR)
+
+
+"""
+------------------------------------------------------------------------
+Define functions
+------------------------------------------------------------------------
+"""
+
+
+def un_token_path():
+    """
+    This function returns the path of the per-user file that holds the UN
+    Data Portal API token. The location follows the platform convention
+    for user configuration files: ``$XDG_CONFIG_HOME`` (or ``~/.config``
+    when that is unset) on macOS and Linux, and ``%APPDATA%`` on Windows.
+
+    Returns:
+        path (str): full path to the user's UN API token file
+    """
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+            os.path.expanduser("~"), ".config"
+        )
+
+    return os.path.join(base, "og", UN_TOKEN_FILENAME)
+
+
+def _clean_un_token(un_token):
+    """
+    This function normalizes a UN Data Portal API token by removing
+    surrounding whitespace and any leading "Bearer " prefix, so that the
+    request header is not doubled into "Bearer Bearer <token>".
+
+    Args:
+        un_token (str): raw token, may be None
+
+    Returns:
+        un_token (str): normalized token, empty string if none was given
+    """
+    un_token = (un_token or "").strip()
+    if un_token.lower().startswith("bearer "):
+        un_token = un_token[len("bearer ") :].strip()
+
+    return un_token
+
+
+def un_token_expiry(un_token):
+    """
+    This function reads the expiry date out of a UN Data Portal API token.
+    The portal issues JSON Web Tokens, whose middle segment carries an
+    ``exp`` claim, so the date can be read without a network call. The
+    signature is not checked and is not needed here: the portal remains
+    the authority on whether a token is accepted, and this is only used to
+    tell a user that renewing is due.
+
+    Args:
+        un_token (str): token to inspect
+
+    Returns:
+        expiry (datetime.date): expiry date, or None when the token is not
+            a readable JSON Web Token
+    """
+    try:
+        payload = un_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+
+        return datetime.datetime.fromtimestamp(
+            claims["exp"], datetime.timezone.utc
+        ).date()
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None  # opaque token, or a format we do not recognize
+
+
+def _utc_today():
+    """Today's date in UTC, to compare against a token's expiry claim."""
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def _warn_if_un_token_expired(un_token):
+    """
+    This function says, once per session, that a token has expired. An
+    expired token otherwise fails in the same silent-looking way as a
+    missing one: the request is refused and the caller quietly falls back
+    to the archived data.
+
+    Args:
+        un_token (str): the token that was resolved
+
+    Returns:
+        None
+    """
+    global _WARNED_EXPIRED_UN_TOKEN
+    if _WARNED_EXPIRED_UN_TOKEN:
+        return
+    expiry = un_token_expiry(un_token)
+    if expiry is None or expiry >= _utc_today():
+        return
+    _WARNED_EXPIRED_UN_TOKEN = True
+
+    lines = [
+        f"Your UN API token expired on {expiry}, so the archived data "
+        "will be used.",
+        f"  Get a new one at {UN_TOKEN_URL}",
+    ]
+    command = og_token_command()
+    if command:
+        lines.append(f"  Then run: {command} set")
+    else:
+        lines.append(f"  Then save it to {un_token_path()}")
+    print("\n".join(lines))
+
+
+def og_token_command():
+    """
+    This function returns the full path of the ``og-token`` command that
+    belongs to the running interpreter, so that a message can tell the
+    user exactly what to type. The command is installed beside the
+    interpreter and is usually not on the shell's PATH, because OG-Core is
+    normally run from a project virtual environment.
+
+    Returns:
+        command (str): full path to og-token, or None when it is not
+            installed alongside this interpreter
+    """
+    name = "og-token.exe" if os.name == "nt" else "og-token"
+    command = os.path.join(os.path.dirname(sys.executable), name)
+
+    return command if os.path.exists(command) else None
+
+
+def _hint_how_to_register_token():
+    """
+    This function prints, once per session, how to register a token. It
+    runs whenever a request falls back to the archived data, so a user who
+    obtains a token later is told what to do without being prompted again
+    on every run.
+    """
+    global _HINTED_NO_UN_TOKEN
+    if _HINTED_NO_UN_TOKEN:
+        return
+    _HINTED_NO_UN_TOKEN = True
+
+    lines = [
+        "No UN API token registered, so the archived data will be used.",
+        f"  Get a free token at {UN_TOKEN_URL}",
+    ]
+    command = og_token_command()
+    if command:
+        lines.append(f"  Then run: {command} set")
+        lines.append(f"  (or save the token to {un_token_path()})")
+    else:
+        lines.append(f"  Then save the token to {un_token_path()}")
+    print("\n".join(lines))
+
+
+def resolve_un_token(un_token=None):
+    """
+    This function finds the UN Data Portal API token to use for a
+    request. Sources are tried in order and the first one that is present
+    wins:
+
+    1. the ``un_token`` argument
+    2. the ``UN_API_TOKEN`` environment variable
+    3. the per-user file at :func:`un_token_path`
+    4. ``un_api_token.txt`` in the current working directory (deprecated)
+
+    When no source holds a token the user is asked for one and the answer
+    is saved to the per-user file, so a token is entered once per machine
+    rather than once per directory. The prompt is skipped when standard
+    input is not interactive, in which case an empty token is returned and
+    the caller falls back to the Population-Data archive.
+
+    Args:
+        un_token (str): token supplied by the caller, overrides all other
+            sources
+
+    Returns:
+        un_token (str): normalized token, empty string if none was found
+    """
+    un_token = _find_un_token(un_token)
+    if un_token:
+        _warn_if_un_token_expired(un_token)
+    else:
+        _hint_how_to_register_token()
+
+    return un_token
+
+
+def _find_un_token(un_token=None):
+    """
+    This function does the source-by-source lookup described in
+    :func:`resolve_un_token`, which wraps it to add the one-time hint when
+    nothing is found.
+
+    Args:
+        un_token (str): token supplied by the caller
+
+    Returns:
+        un_token (str): normalized token, empty string if none was found
+    """
+    global _WARNED_LEGACY_UN_TOKEN
+
+    if un_token:
+        return _clean_un_token(un_token)
+
+    # .strip() so a variable set to blank space falls through to the files
+    # rather than silently resolving to no token at all.
+    if os.environ.get("UN_API_TOKEN", "").strip():
+        return _clean_un_token(os.environ["UN_API_TOKEN"])
+
+    # An existing per-user file is authoritative even when empty, so that
+    # a user who declined the prompt is not asked again on every call.
+    user_path = un_token_path()
+    if os.path.exists(user_path):
+        with open(user_path, "r") as file:
+            return _clean_un_token(file.read())
+
+    if os.path.exists(UN_TOKEN_FILENAME):
+        if not _WARNED_LEGACY_UN_TOKEN:
+            print(
+                f"Using the UN API token in {UN_TOKEN_FILENAME} in the "
+                "current directory. This location is deprecated because it "
+                "leaves a copy of the token in every directory you run "
+                f"from. Move it to {user_path} to keep one token per user."
+            )
+            _WARNED_LEGACY_UN_TOKEN = True
+        with open(UN_TOKEN_FILENAME, "r") as file:
+            return _clean_un_token(file.read())
+
+    try:
+        if not sys.stdin or not sys.stdin.isatty():
+            return ""  # not interactive, e.g. a scheduled run
+        print(
+            "\nOG-Core can read population data directly from the UN Data "
+            "Portal, which needs a free API token.\n"
+            f"  To get one, open {UN_TOKEN_URL} and click Generate Token.\n"
+            "  Or press return to use the archived copy of the same data "
+            f"at {UN_DATA_ARCHIVE_URL}.\n"
+        )
+        # getpass rather than input so the token is not echoed into the
+        # terminal and its scrollback.
+        un_token = getpass.getpass("UN API token (input is hidden): ")
+    except (EOFError, ValueError):  # stdin at end of file or closed
+        return ""
+
+    # Save the answer, empty or not, so the question is asked only once.
+    try:
+        os.makedirs(os.path.dirname(user_path), exist_ok=True)
+        with open(user_path, "w") as file:
+            file.write(un_token)
+    except OSError as err:  # e.g. a read-only home directory
+        print(
+            f"Could not save the UN API token to {user_path} ({err}). "
+            "It will be used for this session only."
+        )
+    else:
+        try:
+            os.chmod(user_path, 0o600)
+        except OSError:  # permissions are not settable on every platform
+            pass
+        if _clean_un_token(un_token):
+            print(f"Token saved to {user_path}")
+
+    return _clean_un_token(un_token)
+
+
+def un_token_cli(argv=None):
+    """
+    This function is the command line entry point for managing the stored
+    UN Data Portal API token. It is installed as ``og-token`` and takes one
+    of three actions: ``set`` saves a token to the per-user file, ``show``
+    reports where the token lives and which source would be used, and
+    ``rm`` deletes the stored token.
+
+    Args:
+        argv (list): command line arguments, read from sys.argv when not
+            given
+
+    Returns:
+        status (int): process exit status, 0 on success
+    """
+    parser = argparse.ArgumentParser(
+        prog="og-token",
+        description=(
+            "Manage the UN Data Portal API token used by OG-Core. Get a "
+            f"free token from {UN_TOKEN_URL} (click Generate Token). "
+            "Without one, OG-Core reads the archived copy of the same data "
+            f"from {UN_DATA_ARCHIVE_URL}."
+        ),
+    )
+    parser.add_argument(
+        "action",
+        choices=["set", "show", "rm"],
+        help="save a token, report where it lives, or delete it",
+    )
+    args = parser.parse_args(argv)
+    path = un_token_path()
+
+    if args.action == "set":
+        print(f"Get a free token at {UN_TOKEN_URL} (click Generate Token).")
+        try:
+            un_token = _clean_un_token(getpass.getpass("UN API token: "))
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled. Nothing was saved.")
+            return 1
+        if not un_token:
+            print("No token entered. Nothing was saved.")
+            return 1
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as file:
+                file.write(un_token)
+        except OSError as err:
+            print(f"Could not write {path} ({err}).")
+            return 1
+        try:
+            os.chmod(path, 0o600)
+        except OSError:  # permissions are not settable on every platform
+            pass
+        expiry = un_token_expiry(un_token)
+        if expiry is None:
+            print(f"Token saved to {path}")
+        elif expiry < _utc_today():
+            print(f"Token saved to {path}, but it expired on {expiry}.")
+            print(f"Get a current one at {UN_TOKEN_URL}")
+        else:
+            print(f"Token saved to {path}, valid until {expiry}")
+        return 0
+
+    if args.action == "rm":
+        if not os.path.exists(path):
+            print(f"No token stored at {path}")
+            return 1
+        try:
+            os.remove(path)
+        except OSError as err:
+            print(f"Could not remove {path} ({err}).")
+            return 1
+        print(f"Removed {path}")
+        return 0
+
+    # show
+    print(f"Token file: {path}")
+    if os.path.exists(path):
+        with open(path, "r") as file:
+            stored = _clean_un_token(file.read())
+        if not stored:
+            print("  present but empty, so no token is sent")
+        else:
+            expiry = un_token_expiry(stored)
+            if expiry is None:
+                print("  a token is stored")
+            elif expiry < _utc_today():
+                print(f"  a token is stored, but it expired on {expiry}")
+                print(f"  get a new one at {UN_TOKEN_URL}")
+            else:
+                days = (expiry - _utc_today()).days
+                print(
+                    f"  a token is stored, valid until {expiry} ({days} days)"
+                )
+    else:
+        print("  not set, run 'og-token set'")
+    if os.environ.get("UN_API_TOKEN", "").strip():
+        print("UN_API_TOKEN is set and takes precedence over the file.")
+    if os.path.exists(UN_TOKEN_FILENAME):
+        print(
+            f"A deprecated {UN_TOKEN_FILENAME} is in this directory. It is "
+            "only used when neither of the above is set."
+        )
+
+    return 0
+
+
+def get_un_data(
+    variable_code,
+    country_id=UN_COUNTRY_CODE,
+    start_year=START_YEAR,
+    end_year=END_YEAR,
+    un_token=None,
+):
+    """
+    This function retrieves data from the United Nations Data Portal API
+    for UN population data (see
+    https://population.un.org/dataportal/about/dataapi)
+
+    Args:
+        variable_code (str): variable code for UN data
+        country_id (str): country id for UN data
+        start_year (int): start year for UN data
+        end_year (int): end year for UN data
+        un_token (str): UN Data Portal API token, resolved from the
+            environment or the user's token file when not given
+
+    Returns:
+        df (Pandas DataFrame): DataFrame of UN data
+    """
+    target = (
+        "https://population.un.org/dataportalapi/api/v1/data/indicators/"
+        + variable_code
+        + "/locations/"
+        + country_id
+        + "/start/"
+        + str(start_year)
+        + "/end/"
+        + str(end_year)
+        + "?format=csv"
+    )
+
+    # get data from url
+    payload = {}
+    headers = {"Authorization": "Bearer " + resolve_un_token(un_token)}
+    response = get_legacy_session().get(target, headers=headers, data=payload)
+    # Check if the request was successful before processing
+    if response.status_code == 200:
+        csvStringIO = StringIO(response.text)
+        df = pd.read_csv(csvStringIO, sep="|", header=1)
+
+        # keep just what is needed from data
+        df = df[df.Variant == "Median"]
+        df = df[df.Sex == "Both sexes"][["TimeLabel", "AgeLabel", "Value"]]
+        df.rename(
+            {"TimeLabel": "year", "AgeLabel": "age", "Value": "value"},
+            axis=1,
+            inplace=True,
+        )
+        # The "100+" top age bin appears only in some series (mortality,
+        # population), so the age column may parse as int (no "100+") or
+        # str. Normalize to str so the replacement works under pandas
+        # >=3.0's strict string dtype, then cast the column to int.
+        df.age = df.age.astype(str)
+        df.loc[df.age == "100+", "age"] = "100"
+        df.age = df.age.astype(int)
+        df.year = df.year.astype(int)
+        df = df[df.age < 100]  # need to drop 100+ age category
+    else:
+        # Read from UN GH Repo:
+        print(
+            "Failed to retrieve population data from UN. Reading "
+            + " from https://github.com/EAPD-DRB/Population-Data "
+            + "instead of UN WPP API"
+        )
+        country_dict = {
+            "840": "USA",
+            "710": "ZAF",
+            "458": "MYS",
+            "356": "IND",
+            "826": "UK",
+            "360": "IDN",
+            "608": "PHL",
+            "764": "THA",
+            "076": "BRA",
+            "410": "KOR",
+            "231": "ETH",
+            "392": "JPN",
+            "242": "FJI",
+            "682": "SAU",
+        }
+        un_variable_dict = {
+            "68": "fertility_rates",
+            "80": "mortality_rates",
+            "47": "population",
+        }
+        country = country_dict[country_id]
+        variable = un_variable_dict[variable_code]
+        url = (
+            "https://raw.githubusercontent.com/EAPD-DRB/"
+            + "Population-Data/main/"
+            + "Data/{c}/UN_{v}_data.csv".format(c=country, v=variable)
+        )
+        df = pd.read_csv(url)
+        # keep just the years requested
+        df = df[(df.year >= start_year) & (df.year <= end_year)]
+
+        # Do we still want to keep the status code for failures?
+        # print(
+        #     "Failed to retrieve population data. HTTP status code: "
+        #     f"{response.status_code}"
+        # )
+        # assert False
+
+    return df
+
+
+def get_fert(
+    totpers=100,
+    min_age=0,
+    max_age=99,
+    country_id=UN_COUNTRY_CODE,
+    start_year=START_YEAR,
+    end_year=END_YEAR,
+    graph=False,
+    plot_path=None,
+    download_path=None,
+):
+    """
+    This function generates a vector of fertility rates by model period
+    age that corresponds to the fertility rate data by age in years.
+
+    Args:
+        totpers (int): total number of agent life periods (E+S), >= 3
+        min_age (int): age in years at which agents are born, >= 0
+        max_age (int): age in years at which agents die with certainty,
+            >= 4, < 100 (max age in UN data is 99, 100+ i same group)
+        country_id (str): country id for UN data
+        start_year (int): start year for UN data
+        end_year (int): end year for UN data
+        graph (bool): =True if want graphical output
+        plot_path (str): path to save fertility rate plot
+        download_path (str): path to save fertility rate data
+
+    Returns:
+        (tuple): fertility rates and, optionally, a figure:
+
+            * fert_rates (Numpy array): fertility rates for each year of
+              data and model age
+            * fig (Matplotlib Figure): figure object if graph=True and
+              plot_path=None
+
+    """
+    # initialize fert rates array
+    fert_rates_2D = np.zeros((end_year + 1 - start_year, totpers))
+    # Read UN data
+    df = get_un_data(
+        "68", country_id=country_id, start_year=start_year, end_year=end_year
+    )
+    # CLean and rebin data
+    for y in range(start_year, end_year + 1):
+        df_y = df[(df.age >= min_age) & (df.age <= max_age) & (df.year == y)]
+        # put in vector
+        fert_rates = df_y.value.values
+        # fill in with zeros for ages  < 15 and > 49
+        # NOTE: this assumes min_year < 15 and max_age > 49
+        fert_rates = np.append(fert_rates, np.zeros(max_age - 49))
+        fert_rates = np.append(np.zeros(15 - min_age), fert_rates)
+        # divide by 1000 because fertility rates are number of births per
+        # 1000 woman and we want births per person (might update to account
+        # from fraction men more correctly - below assumes 50/50 men and women)
+        fert_rates = fert_rates / 2000
+        # Rebin data in the case that model period not equal to one calendar
+        # year
+        fert_rates = pop_rebin(fert_rates, totpers)
+        fert_rates_2D[y - start_year, :] = fert_rates
+
+    if download_path:
+        np.savetxt(
+            os.path.join(download_path, "fert_rates.csv"),
+            fert_rates_2D,
+            delimiter=",",
+        )
+
+    # Create plots if needed
+    if graph:
+        if start_year == end_year:
+            years_list = [str(start_year)]
+            fert_rates_list = [fert_rates_2D[0, :]]
+        else:
+            years_list = [str(x) for x in np.arange(start_year, end_year + 1)]
+            fert_rates_list = [
+                fert_rates_2D[i, :] for i in range(fert_rates_2D.shape[0])
+            ]
+        if plot_path is not None:
+            pp.plot_fert_rates(
+                fert_rates_list,
+                labels=years_list,
+                path=plot_path,
+            )
+            return fert_rates_2D
+        else:
+            fig = pp.plot_fert_rates(
+                fert_rates_list,
+                labels=years_list,
+            )
+            return fert_rates_2D, fig
+    else:
+        return fert_rates_2D
+
+
+def get_mort(
+    totpers=100,
+    min_age=0,
+    max_age=99,
+    country_id=UN_COUNTRY_CODE,
+    start_year=START_YEAR,
+    end_year=END_YEAR,
+    graph=False,
+    plot_path=None,
+    download_path=None,
+):
+    """
+    This function generates a vector of mortality rates by model period
+    age.
+
+    Args:
+        totpers (int): total number of agent life periods (E+S), >= 3
+        min_age (int): age in years at which agents are born, >= 0
+        max_age (int): age in years at which agents die with certainty,
+            >= 4, < 100 (max age in UN data is 99, 100+ i same group)
+        country_id (str): country id for UN data
+        start_year (int): start year for UN data
+        end_year (int): end year for UN data
+        graph (bool): =True if want graphical output
+        plot_path (str): path to save mortality rate plot
+        download_path (str): path to save mortality rate data
+
+    Returns:
+        (tuple): mortality rates and, optionally, a figure:
+
+            * mort_rates (Numpy array): mortality rates for each year of
+              data and model age
+            * infmort_rate_vec (Numpy array): infant mortality rates for
+              each year of data
+            * fig (Matplotlib Figure): figure object if graph=True and
+              plot_path=None
+
+    """
+    mort_rates_2D = np.zeros((end_year + 1 - start_year, totpers))
+    infmort_rate_vec = np.zeros(end_year + 1 - start_year)
+    # Read UN data
+    df = get_un_data(
+        "80", country_id=country_id, start_year=start_year, end_year=end_year
+    )
+    # CLean and rebin data
+    for y in range(start_year, end_year + 1):
+        df_y = df[(df.age >= min_age) & (df.age <= max_age) & (df.year == y)]
+        # put in vector
+        mort_rates_data = df_y.value.values
+        # In UN data, mortality rates for 0 year olds are the infant
+        # mortality rates
+        infmort_rate = mort_rates_data[0]
+        # Rebin data in the case that model period not equal to one calendar
+        # year
+        # make mort rates those from age 1-100 and set to 1 for age 100
+        mort_rates_data = np.append(mort_rates_data[1:], 1.0)
+        mort_rates = pop_rebin(mort_rates_data, totpers)
+        # put in 2D array
+        mort_rates_2D[y - start_year, :] = mort_rates
+        infmort_rate_vec[y - start_year] = infmort_rate
+
+    if download_path:
+        np.savetxt(
+            os.path.join(download_path, "mort_rates.csv"),
+            mort_rates_2D,
+            delimiter=",",
+        )
+        np.savetxt(
+            os.path.join(download_path, "infmort_rates.csv"),
+            infmort_rate_vec,
+            delimiter=",",
+        )
+
+    # Create plots if needed
+    if graph:
+        if start_year == end_year:
+            years_to_plot = [start_year]
+        else:
+            years_to_plot = [start_year, end_year]
+        if plot_path is not None:
+            pp.plot_mort_rates_data(
+                mort_rates_2D,
+                start_year,
+                years_to_plot,
+                path=plot_path,
+            )
+            return mort_rates_2D, infmort_rate_vec
+        else:
+            fig = pp.plot_mort_rates_data(
+                mort_rates_2D,
+                start_year,
+                years_to_plot,
+            )
+            return mort_rates_2D, infmort_rate_vec, fig
+    else:
+        return mort_rates_2D, infmort_rate_vec
+
+
+def get_pop(
+    E=20,
+    S=80,
+    min_age=0,
+    max_age=99,
+    infer_pop=False,
+    fert_rates=None,
+    mort_rates=None,
+    infmort_rates=None,
+    imm_rates=None,
+    initial_pop=None,
+    country_id=UN_COUNTRY_CODE,
+    start_year=START_YEAR,
+    end_year=END_YEAR,
+    download_path=None,
+):
+    """
+    Retrieves the population distribution data from the UN data API
+
+    Args:
+        E (int): number of model periods in which agent is not
+            economically active, >= 1
+        S (int): number of model periods in which agent is economically
+            active, >= 3
+        min_age (int): age in years at which agents are born, >= 0
+        max_age (int): age in years at which agents die with certainty,
+            >= 4, < 100 (max age in UN data is 99, 100+ i same group)
+        infer_pop (bool): =True if want to infer the population
+            from the given fertility, mortality, and immigration rates
+        fert_rates (Numpy array): fertility rates for each year of data
+            and model age
+        mort_rates (Numpy array): mortality rates for each year of data
+            and model age
+        infmort_rates (Numpy array): infant mortality rates for each year
+            of data
+        imm_rates (Numpy array): immigration rates for reach year of data
+            and model age
+        initial_pop_data (Pandas DataFrame): initial population data
+            for the first year of model calibration (start_year)
+        country_id (str): country id for UN data
+        start_year (int): start year data
+        end_year (int): end year for data
+        download_path (str): path to save population distribution data
+
+    Returns:
+        pop_2D (Numpy array): population distribution over T0 periods
+    """
+    # Generate time path of the nonstationary population distribution
+    # Get path up to end of data year
+    pop_2D = np.zeros((end_year + 2 - start_year, E + S))
+    if infer_pop:
+        if initial_pop is None:
+            initial_pop_data = get_un_data(
+                "47",
+                country_id=country_id,
+                start_year=start_year,
+                end_year=start_year,
+            )
+            initial_pop_sample = initial_pop_data[
+                (initial_pop_data["age"] >= min_age)
+                & (initial_pop_data["age"] <= max_age)
+            ]
+            initial_pop = initial_pop_sample.value.values
+            initial_pop = pop_rebin(initial_pop, E + S)
+        # Check that have all necessary inputs to infer the population
+        # distribution
+        assert not [
+            x
+            for x in (fert_rates, mort_rates, infmort_rates, imm_rates)
+            if x is None
+        ]
+        len_pop_dist = end_year + 1 - start_year
+        pop_2D = np.zeros((len_pop_dist, E + S))
+        # set initial population distribution in the counterfactual to
+        # the first year of the user provided distribution
+        pop_2D[0, :] = initial_pop
+        for t in range(1, len_pop_dist):
+            # find newborns next period
+            newborns = np.dot(fert_rates[t - 1, :], pop_2D[t - 1, :])
+            pop_2D[t, 0] = (1 - infmort_rates[t - 1]) * newborns + imm_rates[
+                t - 1, 0
+            ] * pop_2D[t - 1, 0]
+            pop_2D[t, 1:] = (
+                pop_2D[t - 1, :-1] * (1 - mort_rates[t - 1, :-1])
+                + pop_2D[t - 1, 1:] * imm_rates[t - 1, 1:]
+            )
+    else:
+        # Read UN data
+        pop_data = get_un_data(
+            "47",
+            country_id=country_id,
+            start_year=start_year,
+            # note go to + 2 because needed to infer immigration
+            # for end_year
+            end_year=end_year + 2,
+        )
+        # CLean and rebin data
+        for y in range(start_year, end_year + 2):
+            pop_data_sample = pop_data[
+                (pop_data["age"] >= min_age)
+                & (pop_data["age"] <= max_age)
+                & (pop_data["year"] == y)
+            ]
+            pop = pop_data_sample.value.values
+            # Generate the current population distribution given that E+S might
+            # be less than max_age-min_age+1
+            pop_EpS = pop_rebin(pop, E + S)
+            pop_2D[y - start_year, :] = pop_EpS
+
+    if download_path:
+        np.savetxt(
+            os.path.join(download_path, "population_distribution.csv"),
+            pop_2D,
+            delimiter=",",
+        )
+
+    return pop_2D
+
+
+def pop_rebin(curr_pop_dist, totpers_new):
+    """
+    For cases in which totpers (E+S) is less than the number of periods
+    in the population distribution data, this function calculates a new
+    population distribution vector with totpers (E+S) elements.
+
+    Args:
+        curr_pop_dist (Numpy array): population distribution over N
+            periods
+        totpers_new (int): number of periods to which we are
+            transforming the population distribution, >= 3
+
+    Returns:
+        curr_pop_new (Numpy array): new population distribution over
+            totpers (E+S) periods that approximates curr_pop_dist
+
+    """
+    # Number of periods in original data
+    assert totpers_new >= 3
+
+    # Number of periods in original data
+    totpers_orig = len(curr_pop_dist)
+    if int(totpers_new) == totpers_orig:
+        curr_pop_new = curr_pop_dist
+    elif int(totpers_new) < totpers_orig:
+        num_sub_bins = float(10000)
+        curr_pop_sub = np.repeat(
+            np.float64(curr_pop_dist) / num_sub_bins, num_sub_bins
+        )
+        len_subbins = (np.float64(totpers_orig * num_sub_bins)) / totpers_new
+        curr_pop_new = np.zeros(totpers_new, dtype=np.float64)
+        end_sub_bin = 0
+        for i in range(totpers_new):
+            beg_sub_bin = int(end_sub_bin)
+            end_sub_bin = int(np.rint((i + 1) * len_subbins))
+            curr_pop_new[i] = curr_pop_sub[beg_sub_bin:end_sub_bin].sum()
+        # Return curr_pop_new to single precision float (float32)
+        # datatype
+        curr_pop_new = np.float32(curr_pop_new)
+
+    return curr_pop_new
+
+
+def get_imm_rates(
+    totpers=100,
+    min_age=0,
+    max_age=99,
+    fert_rates=None,
+    mort_rates=None,
+    infmort_rates=None,
+    pop_dist=None,
+    country_id=UN_COUNTRY_CODE,
+    start_year=START_YEAR,
+    end_year=END_YEAR,
+    graph=False,
+    plot_path=None,
+    download_path=None,
+):
+    """
+    Calculate immigration rates by age as a residual given population
+    levels in different periods, then output average calculated
+    immigration rate. We have to replace the first mortality rate in
+    this function in order to adjust the first implied immigration rate
+
+    Args:
+        totpers (int): total number of agent life periods (E+S), >= 3
+        min_age (int): age in years at which agents are born, >= 0
+        max_age (int): age in years at which agents die with certainty,
+            >= 4
+        fert_rates (Numpy array): fertility rates for each year of data
+            and model age
+        mort_rates (Numpy array): mortality rates for each year of data
+            and model age
+        infmort_rates (Numpy array): infant mortality rates for each year
+            of data
+        pop_dist (Numpy array): population distribution over T0+1 periods
+        country_id (str): country id for UN data
+        start_year (int): start year for UN data
+        end_year (int): end year for UN data
+        graph (bool): =True if want graphical output
+        plot_path (str): path to save figure to
+        download_path (str): path to save immigration rate data
+
+    Returns:
+        imm_rates_2D (Numpy array):immigration rates that correspond to
+            each year of data and period of life, length E+S
+
+    """
+    imm_rates_2D = np.zeros((end_year + 1 - start_year, totpers))
+    if fert_rates is None:
+        # get fert rates from UN data from initial year to data year
+        fert_rates = get_fert(
+            totpers, min_age, max_age, country_id, start_year, end_year
+        )
+    else:
+        # ensure that user provided fert_rates and mort rates of same size
+        assert fert_rates.shape == mort_rates.shape
+    if mort_rates is None:
+        # get mort rates from UN data from initial year to data year
+        mort_rates, infmort_rates = get_mort(
+            totpers, min_age, max_age, country_id, start_year, end_year
+        )
+    else:
+        # ensure that user provided fert_rates and mort rates of same size
+        assert fert_rates.shape == mort_rates.shape
+        assert infmort_rates is not None
+        assert infmort_rates.shape[0] == mort_rates.shape[0]
+    if pop_dist is None:
+        # need to read UN population data
+        df = get_un_data(
+            "47",
+            country_id=country_id,
+            start_year=start_year,
+            end_year=end_year + 2,
+        )
+        pop_dist = np.zeros((end_year + 2 - start_year, totpers))
+        for y in range(start_year, end_year + 1):
+            pop_t = df[
+                (df.age < 100) & (df.age >= 0) & (df.year == y)
+            ].value.values
+            pop_t = pop_rebin(pop_t, totpers)
+            pop_dist[y - start_year, :] = pop_t
+    # Make sure shape conforms
+    assert pop_dist.shape[1] == mort_rates.shape[1]
+    assert pop_dist.shape[0] == end_year - start_year + 2
+    for y in range(start_year, end_year + 1):
+        pop_t = pop_dist[y - start_year, :]
+        pop_tp1 = pop_dist[y + 1 - start_year, :]
+        # initialize imm_rate vector
+        imm_rates = np.zeros(totpers)
+        # back out imm rates by age for each year
+        newborns = np.dot(fert_rates[y - start_year, :], pop_t)
+        # new born imm_rate
+        imm_rates[0] = (
+            pop_tp1[0] - (1 - infmort_rates[y - start_year]) * newborns
+        ) / pop_t[0]
+        # all other age imm_rates
+        imm_rates[1:] = (
+            pop_tp1[1:] - (1 - mort_rates[y - start_year, :-1]) * pop_t[:-1]
+        ) / pop_t[1:]
+
+        imm_rates_2D[y - start_year, :] = imm_rates
+
+    if download_path:
+        np.savetxt(
+            os.path.join(download_path, "immigration_rates.csv"),
+            imm_rates_2D,
+            delimiter=",",
+        )
+
+    # Create plots if needed
+    if graph:
+        if start_year == end_year:
+            years_to_plot = [start_year]
+        else:
+            years_to_plot = [start_year, end_year]
+        if plot_path is not None:
+            pp.plot_imm_rates(
+                imm_rates_2D,
+                start_year,
+                years_to_plot,
+                path=plot_path,
+            )
+            return imm_rates_2D
+        else:
+            fig = pp.plot_imm_rates(
+                imm_rates_2D,
+                start_year,
+                years_to_plot,
+            )
+            return imm_rates_2D, fig
+    else:
+        return imm_rates_2D
+
+
+def immsolve(imm_rates, *args):
+    """
+    This function generates a vector of errors representing the
+    difference in two consecutive periods stationary population
+    distributions. This vector of differences is the zero-function
+    objective used to solve for the immigration rates vector, similar to
+    the original immigration rates vector from get_imm_rates(), that
+    sets the steady-state population distribution by age equal to the
+    population distribution in period int(1.5*S)
+
+    Args:
+        imm_rates (Numpy array):immigration rates that correspond to
+            each period of life, length E+S
+        args (tuple): (fert_rates, mort_rates, infmort_rates, omega_cur,
+            g_n_SS)
+
+    Returns:
+        omega_errs (Numpy array): difference between omega_new and
+            omega_cur_pct, length E+S
+
+    """
+    fert_rates, mort_rates, infmort_rates, omega_cur_lev, g_n_SS = args
+    omega_cur_pct = omega_cur_lev / omega_cur_lev.sum()
+    totpers = len(fert_rates)
+    OMEGA = np.zeros((totpers, totpers))
+    OMEGA[0, :] = (1 - infmort_rates) * fert_rates + np.hstack(
+        (imm_rates[0], np.zeros(totpers - 1))
+    )
+    OMEGA[1:, :-1] += np.diag(1 - mort_rates[:-1])
+    OMEGA[1:, 1:] += np.diag(imm_rates[1:])
+    omega_new = np.dot(OMEGA, omega_cur_pct) / (1 + g_n_SS)
+    omega_errs = omega_new - omega_cur_pct
+
+    return omega_errs
+
+
+def _logistic(x):
+    """
+    Numerically stable logistic transform.
+    """
+    return 1 / (1 + np.exp(-np.clip(x, -700, 700)))
+
+
+def _income_shares_and_midpoints(income_percentiles):
+    """
+    Convert income group population shares into centered percentile midpoints.
+    """
+    income_shares = np.asarray(income_percentiles, dtype=float).ravel()
+    if income_shares.ndim != 1 or income_shares.size < 1:
+        raise ValueError("income_percentiles must be a one-dimensional array.")
+    if np.any(income_shares <= 0):
+        raise ValueError("income_percentiles must contain positive values.")
+    income_shares = income_shares / income_shares.sum()
+    percentile_midpoints = (
+        100 * (np.cumsum(income_shares) - 0.5 * income_shares) - 50
+    )
+    return income_shares, percentile_midpoints
+
+
+def _extend_time_path(arr, num_periods):
+    """
+    Extend or trim the first dimension of an array to num_periods.
+    """
+    if arr.shape[0] == num_periods:
+        return arr
+    if arr.shape[0] > num_periods:
+        return arr[:num_periods]
+    extension = np.repeat(arr[-1:, ...], num_periods - arr.shape[0], axis=0)
+    return np.concatenate((arr, extension), axis=0)
+
+
+def _format_age_gradient(gradient, num_periods, E, S, name):
+    """
+    Put an age gradient into a num_periods x (E+S) array.
+
+    A length-S vector is interpreted as applying to economically active ages
+    only, with zero gradients for younger ages.
+    """
+    totpers = E + S
+    if gradient is None:
+        return np.zeros((num_periods, totpers))
+
+    gradient = np.asarray(gradient, dtype=float)
+    if gradient.ndim == 0:
+        return np.full((num_periods, totpers), gradient)
+
+    if gradient.ndim == 1:
+        if gradient.shape[0] == 1:
+            full_gradient = np.full(totpers, gradient.item())
+        elif gradient.shape[0] == S:
+            full_gradient = np.concatenate((np.zeros(E), gradient))
+        elif gradient.shape[0] == totpers:
+            full_gradient = gradient
+        else:
+            raise ValueError(
+                f"{name} must have length 1, S={S}, or E+S={totpers}."
+            )
+        return np.tile(full_gradient.reshape(1, totpers), (num_periods, 1))
+
+    if gradient.ndim == 2:
+        if gradient.shape[1] == S:
+            gradient = np.concatenate(
+                (np.zeros((gradient.shape[0], E)), gradient), axis=1
+            )
+        elif gradient.shape[1] != totpers:
+            raise ValueError(
+                f"{name} must have second dimension S={S} or E+S={totpers}."
+            )
+        return _extend_time_path(gradient, num_periods)
+
+    raise ValueError(f"{name} must be a scalar, vector, or 2D array.")
+
+
+def _format_infmort_gradient(gradient, num_periods):
+    """
+    Put an infant mortality gradient into a num_periods vector.
+    """
+    if gradient is None:
+        return np.zeros(num_periods)
+
+    gradient = np.asarray(gradient, dtype=float)
+    if gradient.ndim == 0:
+        return np.full(num_periods, gradient)
+    if gradient.ndim == 1:
+        if gradient.shape[0] == 1:
+            return np.full(num_periods, gradient.item())
+        return _extend_time_path(gradient.reshape(-1, 1), num_periods).ravel()
+
+    raise ValueError("infmort_gradient must be a scalar or vector.")
+
+
+def _format_imm_shares(imm_pctiles, num_periods, E, S, income_shares):
+    """
+    Format immigrant income shares as num_periods x (E+S) x J.
+    """
+    totpers = E + S
+    J = income_shares.shape[0]
+    if imm_pctiles is None:
+        return np.tile(
+            income_shares.reshape(1, 1, J), (num_periods, totpers, 1)
+        )
+
+    imm_shares = np.asarray(imm_pctiles, dtype=float)
+    if imm_shares.ndim == 1:
+        if imm_shares.shape[0] != J:
+            raise ValueError(f"imm_pctiles must have J={J} elements.")
+        imm_shares = np.tile(
+            imm_shares.reshape(1, 1, J), (num_periods, totpers, 1)
+        )
+    elif imm_shares.ndim == 2:
+        if imm_shares.shape[-1] != J:
+            raise ValueError(f"imm_pctiles last dimension must be J={J}.")
+        if imm_shares.shape[0] == S:
+            young_shares = np.tile(income_shares.reshape(1, J), (E, 1))
+            imm_shares = np.concatenate((young_shares, imm_shares), axis=0)
+        elif imm_shares.shape[0] != totpers:
+            raise ValueError(
+                f"imm_pctiles first dimension must be S={S} or E+S={totpers}."
+            )
+        imm_shares = np.tile(
+            imm_shares.reshape(1, totpers, J), (num_periods, 1, 1)
+        )
+    elif imm_shares.ndim == 3:
+        if imm_shares.shape[-1] != J:
+            raise ValueError(f"imm_pctiles last dimension must be J={J}.")
+        if imm_shares.shape[1] == S:
+            young_shares = np.tile(
+                income_shares.reshape(1, 1, J), (imm_shares.shape[0], E, 1)
+            )
+            imm_shares = np.concatenate((young_shares, imm_shares), axis=1)
+        elif imm_shares.shape[1] != totpers:
+            raise ValueError(
+                f"imm_pctiles second dimension must be S={S} or E+S={totpers}."
+            )
+        imm_shares = _extend_time_path(imm_shares, num_periods)
+    else:
+        raise ValueError(
+            "imm_pctiles must be a vector, 2D array, or 3D array."
+        )
+
+    if np.any(imm_shares < 0):
+        raise ValueError("imm_pctiles must be nonnegative.")
+    denom = imm_shares.sum(axis=-1, keepdims=True)
+    if np.any(denom <= 0):
+        raise ValueError("imm_pctiles must sum to a positive value across J.")
+    return imm_shares / denom
+
+
+def _within_age_weights(pop_by_age_j, income_shares):
+    """
+    Compute J weights within each age, using income_shares if an age is empty.
+    """
+    age_totals = pop_by_age_j.sum(axis=-1, keepdims=True)
+    default_weights = np.tile(
+        income_shares.reshape(1, income_shares.shape[0]),
+        (pop_by_age_j.shape[0], 1),
+    )
+    return np.divide(
+        pop_by_age_j,
+        age_totals,
+        out=default_weights,
+        where=age_totals > 0,
+    )
+
+
+def _mean_preserving_logit_rates(mean_rates, slopes, weights, pct_midpoints):
+    """
+    Create J-specific rates bounded in [0, 1] with weighted mean mean_rates.
+    """
+    mean_rates = np.asarray(mean_rates, dtype=float)
+    slopes = np.asarray(slopes, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    rates = np.zeros(weights.shape)
+
+    for idx in np.ndindex(mean_rates.shape):
+        mean_rate = mean_rates[idx]
+        slope = slopes[idx]
+        w = weights[idx]
+        w = w / w.sum()
+
+        if mean_rate <= 0:
+            rates[idx] = 0.0
+        elif mean_rate >= 1:
+            rates[idx] = 1.0
+        elif np.isclose(slope, 0.0):
+            rates[idx] = mean_rate
+        else:
+
+            def mean_error(intercept):
+                return (
+                    np.dot(w, _logistic(intercept + slope * pct_midpoints))
+                    - mean_rate
+                )
+
+            intercept = opt.brentq(mean_error, -700, 700)
+            rates[idx] = _logistic(intercept + slope * pct_midpoints)
+
+    return rates
+
+
+def expand_pop_obj_J(
+    omega_path_lev,
+    omega_path_S,
+    omega_SSfx,
+    fert_rates,
+    mort_rates,
+    infmort_rates,
+    imm_rates,
+    mort_rates_S,
+    imm_rates_mat,
+    E,
+    S,
+    g_n_SS,
+    fixper,
+    income_percentiles=None,
+    fert_gradient=None,
+    mort_gradient=None,
+    infmort_gradient=None,
+    imm_pctiles=None,
+):
+    """
+    Expand aggregate demographic objects to age x income-group objects.
+
+    The aggregate population path and rates are left unchanged. If
+    income_percentiles is None and no income-specific inputs are
+    provided, the aggregate objects are broadcast across a single
+    income group (J=1). Otherwise, income_percentiles gives the initial
+    population distribution across J for every age and the income
+    shares of newborns in every period.
+
+    Args:
+        omega_path_lev (Numpy array): T+S x E+S aggregate population levels.
+        omega_path_S (Numpy array): T+S x S aggregate active-age population
+            shares.
+        omega_SSfx (Numpy array): fixed full-life population distribution.
+        fert_rates (Numpy array): T+S x E+S fertility rates.
+        mort_rates (Numpy array): T+S x E+S mortality rates.
+        infmort_rates (Numpy array): T+S infant mortality rates.
+        imm_rates (Numpy array): T+S x E+S immigration rates, including the
+            adjusted post-fixper rates.
+        mort_rates_S (Numpy array): T+S x S mortality rates for active ages.
+        imm_rates_mat (Numpy array): T+S x S immigration rates for active ages.
+        E (int): number of non-economically active periods.
+        S (int): number of economically active periods.
+        g_n_SS (float): steady-state population growth rate.
+        fixper (int): period at which the fixed steady-state distribution is
+            imposed.
+        income_percentiles (array_like): population shares for each J
+            group; defaults to a single income group when no
+            income-specific inputs are supplied.
+        fert_gradient (array_like): log-odds fertility slopes by age.
+        mort_gradient (array_like): log-odds mortality slopes by age.
+        infmort_gradient (array_like): log-odds infant mortality slopes.
+        imm_pctiles (array_like): immigrant income shares by period,
+        age, and J.
+
+    Returns:
+        dict: demographic objects with the same keys needed by get_pop_objs.
+    """
+    omega_SS = omega_SSfx[-S:] / omega_SSfx[-S:].sum()
+    income_inputs = (
+        fert_gradient,
+        mort_gradient,
+        infmort_gradient,
+        imm_pctiles,
+    )
+    all_income_inputs_none = all(x is None for x in income_inputs)
+    if income_percentiles is None:
+        assert all_income_inputs_none, (
+            "income_percentiles must be provided when using "
+            + "income-specific inputs."
+        )
+        # No income heterogeneity requested: broadcast the aggregate
+        # objects across a single income group.
+        income_percentiles = [100]
+    income_shares, pct_midpoints = _income_shares_and_midpoints(
+        income_percentiles
+    )
+    J = income_shares.shape[0]
+    num_periods, totpers = omega_path_lev.shape
+    assert totpers == E + S
+
+    if all_income_inputs_none:
+        return {
+            "omega_path_S": omega_path_S.reshape(
+                omega_path_S.shape[0], omega_path_S.shape[1], 1
+            )
+            * income_shares.reshape(1, 1, J),
+            "omega_SS": omega_SS.reshape(omega_SS.shape[0], 1)
+            * income_shares.reshape(1, J),
+            "mort_rates_S": np.tile(
+                mort_rates_S.reshape(
+                    mort_rates_S.shape[0], mort_rates_S.shape[1], 1
+                ),
+                (1, 1, J),
+            ),
+            "imm_rates_mat": np.tile(
+                imm_rates_mat.reshape(
+                    imm_rates_mat.shape[0], imm_rates_mat.shape[1], 1
+                ),
+                (1, 1, J),
+            ),
+        }
+
+    fert_slopes = _format_age_gradient(
+        fert_gradient, num_periods, E, S, "fert_gradient"
+    )
+    mort_slopes = _format_age_gradient(
+        mort_gradient, num_periods, E, S, "mort_gradient"
+    )
+    infmort_slopes = _format_infmort_gradient(infmort_gradient, num_periods)
+    imm_shares = _format_imm_shares(
+        imm_pctiles, num_periods, E, S, income_shares
+    )
+
+    # Use the aggregate fixed distribution after fixper, matching the
+    # age-only steady-state logic already computed above.
+    target_pop = np.array(omega_path_lev, dtype=float, copy=True)
+    fixed_full_dist = omega_SSfx / omega_SSfx.sum()
+    if fixper < num_periods:
+        total_pop = target_pop[fixper].sum()
+        target_pop[fixper] = total_pop * fixed_full_dist
+        for t in range(fixper + 1, num_periods):
+            total_pop *= 1 + g_n_SS
+            target_pop[t] = total_pop * fixed_full_dist
+
+    pop_path_J = np.zeros((num_periods, totpers, J))
+    fert_rates_J = np.zeros((num_periods, totpers, J))
+    mort_rates_J = np.zeros((num_periods, totpers, J))
+    imm_rates_J = np.zeros((num_periods, totpers, J))
+    infmort_rates_J = np.zeros((num_periods, J))
+    pop_path_J[0] = target_pop[0, :, None] * income_shares.reshape(1, J)
+    fixed_pop_dist_J = None
+
+    for t in range(num_periods):
+        pop_t_J = pop_path_J[t]
+        age_weights = _within_age_weights(pop_t_J, income_shares)
+        fert_rates_J[t] = _mean_preserving_logit_rates(
+            fert_rates[t], fert_slopes[t], age_weights, pct_midpoints
+        )
+        mort_rates_J[t] = _mean_preserving_logit_rates(
+            mort_rates[t], mort_slopes[t], age_weights, pct_midpoints
+        )
+        infmort_rates_J[t] = _mean_preserving_logit_rates(
+            np.array([infmort_rates[t]]),
+            np.array([infmort_slopes[t]]),
+            income_shares.reshape(1, J),
+            pct_midpoints,
+        )[0]
+
+        births = (fert_rates_J[t] * pop_t_J).sum()
+        newborns = births * income_shares
+        pre_imm_pop = np.zeros((totpers, J))
+        pre_imm_pop[0] = (1 - infmort_rates_J[t]) * newborns
+        pre_imm_pop[1:] = pop_t_J[:-1] * (1 - mort_rates_J[t, :-1])
+
+        if t + 1 < num_periods:
+            target_next = target_pop[t + 1]
+        else:
+            newborns_agg = np.dot(fert_rates[t], target_pop[t])
+            target_next = np.zeros(totpers)
+            target_next[0] = (1 - infmort_rates[t]) * newborns_agg + imm_rates[
+                t, 0
+            ] * target_pop[t, 0]
+            target_next[1:] = (
+                target_pop[t, :-1] * (1 - mort_rates[t, :-1])
+                + imm_rates[t, 1:] * target_pop[t, 1:]
+            )
+
+        if t == fixper:
+            fixed_pop_dist_J = pop_t_J / pop_t_J.sum()
+
+        if fixed_pop_dist_J is not None and t >= fixper:
+            target_next_J = fixed_pop_dist_J * target_next.sum()
+            imm_flow_J = target_next_J - pre_imm_pop
+            pop_next_J = target_next_J
+        else:
+            imm_flow = target_next - pre_imm_pop.sum(axis=1)
+            imm_flow_J = imm_flow[:, None] * imm_shares[t]
+            pop_next_J = pre_imm_pop + imm_flow_J
+
+        imm_rates_J[t] = np.divide(
+            imm_flow_J,
+            pop_t_J,
+            out=np.zeros_like(imm_flow_J),
+            where=pop_t_J != 0,
+        )
+
+        if t + 1 < num_periods:
+            if np.any(pop_next_J < -1e-8):
+                raise ValueError(
+                    "Income-specific demographic inputs imply a negative "
+                    "population in at least one age-income cell."
+                )
+            pop_path_J[t + 1] = np.maximum(pop_next_J, 0.0)
+
+    active_pop_J = pop_path_J[:, E:, :]
+    omega_path_S_J = active_pop_J / active_pop_J.sum(axis=(1, 2)).reshape(
+        num_periods, 1, 1
+    )
+    omega_SS_J = omega_path_S_J[fixper]
+
+    assert np.allclose(omega_path_S_J.sum(axis=2), omega_path_S)
+    assert np.allclose(omega_SS_J.sum(axis=1), omega_SS)
+
+    return {
+        "omega_path_S": omega_path_S_J,
+        "omega_SS": omega_SS_J,
+        "mort_rates_S": mort_rates_J[:, E:, :],
+        "imm_rates_mat": imm_rates_J[:, E:, :],
+    }
+
+
+def get_pop_objs(
+    E=20,
+    S=80,
+    T=320,
+    min_age=0,
+    max_age=99,
+    fert_rates=None,
+    mort_rates=None,
+    infmort_rates=None,
+    imm_rates=None,
+    infer_pop=False,
+    pop_dist=None,
+    fert_gradient=None,
+    mort_gradient=None,
+    infmort_gradient=None,
+    imm_pctiles=None,
+    income_percentiles=None,
+    country_id=UN_COUNTRY_CODE,
+    initial_data_year=START_YEAR - 1,
+    final_data_year=START_YEAR + 2,
+    GraphDiag=True,
+    download_path=None,
+):
+    """
+    This function produces the demographics objects to be used in the
+    OG-USA model package.
+
+    Args:
+        E (int): number of model periods in which agent is not
+            economically active, >= 1
+        S (int): number of model periods in which agent is economically
+            active, >= 3
+        T (int): number of periods to be simulated in TPI, > 2*S
+        min_age (int): age in years at which agents are born, >= 0
+        max_age (int): age in years at which agents die with certainty,
+            >= 4, < 100 (max age in UN data is 99, 100+ i same group)
+        fert_rates (array_like): user provided fertility rates, dimensions
+            are T0 x E+S
+        mort_rates (array_like): user provided mortality rates, dimensions
+            are T0 x E+S
+        infmort_rates (array_like): user provided infant mortality rates,
+            length T0
+        imm_rates (array_like): user provided immigration rates, dimensions
+            are T0 x E+S
+        infer_pop (bool): =True if want to infer the population
+        pop_dist (array_like): user provided population distribution,
+            dimensions are T0+1 x E+S
+        fert_gradient (array_like): user provided fertility rate gradient,
+            dimensions are S, represents the log-odds slope in the
+            fertility rate
+            per percentile of the lifetime income distribution.
+        mort_gradient (array_like): user provided mortality rate gradient,
+            dimensions are S, represents the log-odds slope in the
+            mortality rate
+            per percentile of the lifetime income distribution.
+        infmort_gradient (array_like): user provided infant mortality
+            rate gradient, dimensions are S, represents the log-odds
+            slope in the infant mortality rate per percentile of the
+            lifetime income distribution.
+        imm_pctiles (array_like): user provided lifetime income distribution
+            for new immigrants, shape is num_per x S x J, where num_per
+            is the number of years between initial and final_data_year
+        income_percentiles (array_like): user provided income percentiles,
+            dimensions are J, the number of lifetime income groups;
+            defaults to a single income group (J=1) when no
+            income-specific inputs are supplied
+        country_id (str): country id for UN data
+        initial_data_year (int): initial year of data to use
+            (not relevant if have user provided data)
+        final_data_year (int): final year of data to use,
+            T0=initial_year-final_year + 1
+        pop_dist (array_like): user provided population distribution, last
+            dimension is of length E+S
+        GraphDiag (bool): =True if want graphical output and printed
+                diagnostics
+
+    Returns:
+        pop_dict (dict): includes:
+
+            * omega (Numpy array): initial population distribution, T+S x S x 1
+            * g_n_ss (scalar): steady-state population growth rate
+            * omega_SS (Numpy array): normalized steady-state population
+              distribution, S x 1
+            * rho (Numpy array): mortality rates by age and time period,
+              T x S x 1
+            * g_n (Numpy array): time path of population growth rate, T+S x 1
+            * imm_rates (Numpy array): immigration rates by age over time,
+              T+S x S x 1
+            * omega_S_preTP (Numpy array): pre-transition initial population
+              distribution by age, S x 1
+            * imm_rates_preTP (Numpy array): pre-transition immigration rates
+              by age, S x 1
+            * rho_preTP (Numpy array): pre-transition mortality rates by age,
+              S x 1
+            * g_n_preTP (scalar): pre-transition population growth rate
+
+    """
+    start_data_year = initial_data_year - 1  # grab data from one year
+    T = T + 1  # add one period to T to account for period -1 pop
+    # before initial so have pre-start year population distribution
+    # TODO: this function does not generalize with T.
+    # It assumes one model period is equal to one calendar year in the
+    # time dimension (it does adjust for S, however)
+    T0 = (
+        final_data_year - initial_data_year + 1
+    )  # number of periods until constant fertility and mortality rates
+    print(
+        "Demographics data: Initial Data year = ",
+        initial_data_year,
+        ", Final Data year = ",
+        final_data_year,
+    )
+    assert E + S <= max_age - min_age + 1
+    assert initial_data_year >= 2012 and initial_data_year <= 2100 - 1
+    assert final_data_year >= 2012 and final_data_year <= 2100 - 1
+    # Ensure that the last year of data used is before SS transition assumed
+    # Really, it will need to be well before this
+    assert final_data_year > initial_data_year
+    assert final_data_year < initial_data_year + T
+    assert (
+        T > 2 * T0
+    )  # ensure time path 2x as long as allows rates to fluctuate
+    if imm_rates is not None and pop_dist is None:
+        assert (
+            infer_pop is True
+        )  # if pass immigration rates, need to infer population
+
+    # Get fertility rates if not provided
+    if fert_rates is None:
+        # get fert rates from UN data from initial year to data year
+        fert_rates = get_fert(
+            E + S,
+            min_age,
+            max_age,
+            country_id,
+            start_data_year,
+            final_data_year,
+            download_path=download_path,
+        )
+    else:
+        # ensure that user provided fert_rates are of the correct shape
+        assert fert_rates.shape[0] == T0
+        assert fert_rates.shape[-1] == E + S
+    # Extrapolate fertility rates for the rest of the transition path
+    # the implicit assumption is that they are constant after the
+    # last year of UN or user provided data
+    fert_rates = np.concatenate(
+        (
+            fert_rates,
+            np.tile(
+                fert_rates[-1, :].reshape(1, E + S),
+                (T + S - fert_rates.shape[0], 1),
+            ),
+        ),
+        axis=0,
+    )
+    # Get mortality rates if not provided
+    if mort_rates is None:
+        # get mort rates from UN data from initial year to data year
+        mort_rates, infmort_rates = get_mort(
+            E + S,
+            min_age,
+            max_age,
+            country_id,
+            start_data_year,
+            final_data_year,
+            download_path=download_path,
+        )
+    else:
+        # ensure that user provided mort_rates are of the correct shape
+        assert mort_rates.shape[0] == T0
+        assert mort_rates.shape[-1] == E + S
+        assert infmort_rates is not None
+        assert infmort_rates.shape[0] == mort_rates.shape[0]
+    # Extrapolate mortality rates for the rest of the transition path
+    # the implicit assumption is that they are constant after the
+    # last year of UN or user provided data
+    mort_rates = np.concatenate(
+        (
+            mort_rates,
+            np.tile(
+                mort_rates[-1, :].reshape(1, E + S),
+                (T + S - mort_rates.shape[0], 1),
+            ),
+        ),
+        axis=0,
+    )
+    infmort_rates = np.concatenate(
+        (
+            infmort_rates,
+            np.tile(infmort_rates[-1], (T + S - infmort_rates.shape[0])),
+        )
+    )
+    mort_rates_S = mort_rates[:, E:]
+    # Get population distribution if not provided
+    # or if just provide initial pop and infer_pop=True
+    if (pop_dist is None) or (pop_dist is not None and infer_pop is True):
+        if infer_pop:
+            if pop_dist is not None:
+                initial_pop = pop_dist[0, :].reshape(1, pop_dist.shape[-1])
+            else:
+                initial_pop = None
+            pop_2D = get_pop(
+                E,
+                S,
+                min_age,
+                max_age,
+                infer_pop,
+                fert_rates,
+                mort_rates,
+                infmort_rates,
+                imm_rates,
+                initial_pop,
+                country_id,
+                start_data_year,
+                final_data_year,
+                download_path=download_path,
+            )
+        else:
+            pop_2D = get_pop(
+                E,
+                S,
+                min_age,
+                max_age,
+                country_id=country_id,
+                start_year=start_data_year,
+                end_year=final_data_year,
+                download_path=download_path,
+            )
+    else:
+        # Check first dims of pop_dist as input by user
+        assert pop_dist.shape[0] == T0 + 1  # population needs to be
+        # one year longer in order to find immigration rates
+        assert pop_dist.shape[-1] == E + S
+        # Create 2D array of population distribution
+        pop_2D = np.zeros((T0 + 1, E + S))
+        for t in range(T0 + 1):
+            pop_EpS = pop_rebin(pop_dist[t, :], E + S)
+            pop_2D[t, :] = pop_EpS
+    # Get immigration rates if not provided
+    if imm_rates is None:
+        imm_rates_orig = get_imm_rates(
+            E + S,
+            min_age,
+            max_age,
+            fert_rates,
+            mort_rates,
+            infmort_rates,
+            pop_2D,
+            country_id,
+            start_data_year,
+            final_data_year,
+            download_path=download_path,
+        )
+    else:
+        # ensure that user provided imm_rates are of the correct shape
+        assert imm_rates.shape[0] == T0
+        assert imm_rates.shape[-1] == E + S
+        imm_rates_orig = imm_rates
+    # Extrapolate immigration rates for the rest of the transition path
+    # the implicit assumption is that they are constant after the
+    # last year of UN or user provided data
+    imm_rates_orig = np.concatenate(
+        (
+            imm_rates_orig,
+            np.tile(
+                imm_rates_orig[-1, :].reshape(1, E + S),
+                (T + S - imm_rates_orig.shape[0], 1),
+            ),
+        ),
+        axis=0,
+    )
+    # If the population distribution was given, check it for consistency
+    # with the fertility, mortality, and immigration rates
+    len_pop_dist = pop_2D.shape[0]
+    pop_counter_2D = np.zeros((len_pop_dist, E + S))
+    # set initial population distribution in the counterfactual to
+    # the first year of the user provided distribution
+    pop_counter_2D[0, :] = pop_2D[0, :]
+    for t in range(1, len_pop_dist):
+        # find newborns next period
+        newborns = np.dot(fert_rates[t - 1, :], pop_counter_2D[t - 1, :])
+
+        pop_counter_2D[t, 0] = (
+            1 - infmort_rates[t - 1]
+        ) * newborns + imm_rates_orig[t - 1, 0] * pop_counter_2D[t - 1, 0]
+        pop_counter_2D[t, 1:] = (
+            pop_counter_2D[t - 1, :-1] * (1 - mort_rates[t - 1, :-1])
+            + pop_counter_2D[t - 1, 1:] * imm_rates_orig[t - 1, 1:]
+        )
+    # Check that counterfactual pop dist is close to pop dist given
+    assert np.allclose(pop_counter_2D, pop_2D)
+
+    # Create the transition matrix for the population distribution
+    # from T0 going forward (i.e., past when we have data on forecasts)
+    OMEGA_orig = np.zeros((E + S, E + S))
+    OMEGA_orig[0, :] = (1 - infmort_rates[-1]) * fert_rates[-1, :] + np.hstack(
+        (imm_rates_orig[-1, 0], np.zeros(E + S - 1))
+    )
+    OMEGA_orig[1:, :-1] += np.diag(1 - mort_rates[-1, :-1])
+    OMEGA_orig[1:, 1:] += np.diag(imm_rates_orig[-1, 1:])
+
+    # Solve for steady-state population growth rate and steady-state
+    # population distribution by age using eigenvalue and eigenvector
+    # decomposition
+    eigvalues, eigvectors = np.linalg.eig(OMEGA_orig)
+    g_n_SS = (eigvalues[np.isreal(eigvalues)].real).max() - 1
+    eigvec_raw = eigvectors[
+        :, (eigvalues[np.isreal(eigvalues)].real).argmax()
+    ].real
+    omega_SS_orig = eigvec_raw / eigvec_raw.sum()
+
+    # Generate time path of the population distribution after final
+    # year of data
+    omega_path_lev = np.zeros((T + S, E + S))
+    pop_curr = pop_2D[T0 - 1, :]
+    omega_path_lev[:T0, :] = pop_2D[:T0, :]
+    for per in range(T0, T + S):
+        pop_next = np.dot(OMEGA_orig, pop_curr)
+        omega_path_lev[per, :] = pop_next.copy()
+        pop_curr = pop_next.copy()
+
+    # Force the population distribution after 1.5*S periods to be the
+    # steady-state distribution by adjusting immigration rates, holding
+    # constant mortality, fertility, and SS growth rates
+    imm_tol = 1e-14
+    fixper = int(1.5 * S)
+    assert fixper > T0  # ensure that we are fixing period after data
+    omega_SSfx = omega_path_lev[fixper, :] / omega_path_lev[fixper, :].sum()
+    imm_objs = (
+        fert_rates[fixper, :],
+        mort_rates[fixper, :],
+        infmort_rates[fixper],
+        omega_path_lev[fixper, :],
+        g_n_SS,
+    )
+    imm_fulloutput = opt.fsolve(
+        immsolve,
+        imm_rates_orig[fixper, :],
+        args=(imm_objs),
+        full_output=True,
+        xtol=imm_tol,
+    )
+    imm_rates_adj = imm_fulloutput[0]
+    imm_diagdict = imm_fulloutput[1]
+    omega_path_S = omega_path_lev[:, -S:] / (
+        omega_path_lev[:, -S:].sum(axis=1).reshape((T + S, 1))
+    )
+    omega_path_S[fixper:, :] = np.tile(
+        omega_path_S[fixper, :].reshape((1, S)), (T + S - fixper, 1)
+    )
+    g_n_path = np.zeros(T + S)
+    g_n_path[:-1] = (
+        omega_path_lev[1:, -S:].sum(axis=1)
+        - omega_path_lev[:-1, -S:].sum(axis=1)
+    ) / omega_path_lev[:-1, -S:].sum(axis=1)
+    g_n_path[fixper + 1 :] = g_n_SS
+    imm_rates_full = np.concatenate(
+        (
+            imm_rates_orig[:fixper, :],
+            np.tile(imm_rates_adj.reshape(1, E + S), (T + S - fixper, 1)),
+        ),
+        axis=0,
+    )
+    imm_rates_mat = imm_rates_full[:, E:]
+
+    if GraphDiag:
+        # Check whether original SS population distribution is close to
+        # the period-T population distribution
+        omegaSSmaxdif = np.absolute(
+            omega_SS_orig - (omega_path_lev[T, :] / omega_path_lev[T, :].sum())
+        ).max()
+        if omegaSSmaxdif > 0.0003:
+            print(
+                "POP. WARNING: Max. abs. dist. between original SS "
+                + "pop. dist'n and period-T pop. dist'n is greater than"
+                + " 0.0003. It is "
+                + str(omegaSSmaxdif)
+                + "."
+            )
+        else:
+            print(
+                "POP. SUCCESS: orig. SS pop. dist is very close to "
+                + "period-T pop. dist'n. The maximum absolute "
+                + "difference is "
+                + str(omegaSSmaxdif)
+                + "."
+            )
+
+        # Plot the adjusted steady-state population distribution versus
+        # the original population distribution. The difference should be
+        # small
+        omegaSSvTmaxdiff = np.absolute(omega_SS_orig - omega_SSfx).max()
+        if omegaSSvTmaxdiff > 0.0003:
+            print(
+                "POP. WARNING: The maximum absolute difference "
+                + "between any two corresponding points in the original"
+                + " and adjusted steady-state population "
+                + "distributions is"
+                + str(omegaSSvTmaxdiff)
+                + ", "
+                + "which is greater than 0.0003."
+            )
+        else:
+            print(
+                "POP. SUCCESS: The maximum absolute difference "
+                + "between any two corresponding points in the original"
+                + " and adjusted steady-state population "
+                + "distributions is "
+                + str(omegaSSvTmaxdiff)
+            )
+
+        # Print whether or not the adjusted immigration rates solved the
+        # zero condition
+        immtol_solved = np.absolute(imm_diagdict["fvec"].max()) < imm_tol
+        if immtol_solved:
+            print(
+                "POP. SUCCESS: Adjusted immigration rates solved "
+                + "with maximum absolute error of "
+                + str(np.absolute(imm_diagdict["fvec"].max()))
+                + ", which is less than the tolerance of "
+                + str(imm_tol)
+            )
+        else:
+            print(
+                "POP. WARNING: Adjusted immigration rates did not "
+                + "solve. Maximum absolute error of "
+                + str(np.absolute(imm_diagdict["fvec"].max()))
+                + " is greater than the tolerance of "
+                + str(imm_tol)
+            )
+
+        # Test whether the steady-state growth rates implied by the
+        # adjusted OMEGA matrix equals the steady-state growth rate of
+        # the original OMEGA matrix
+        OMEGA2 = np.zeros((E + S, E + S))
+        OMEGA2[0, :] = (1 - infmort_rates[-1]) * fert_rates[-1, :] + np.hstack(
+            (imm_rates_adj[0], np.zeros(E + S - 1))
+        )
+        OMEGA2[1:, :-1] += np.diag(1 - mort_rates[-1, :-1])
+        OMEGA2[1:, 1:] += np.diag(imm_rates_adj[1:])
+        eigvalues2, eigvectors2 = np.linalg.eig(OMEGA2)
+        g_n_SS_adj = (eigvalues[np.isreal(eigvalues2)].real).max() - 1
+        if np.max(np.absolute(g_n_SS_adj - g_n_SS)) > 10 ** (-8):
+            print(
+                "FAILURE: The steady-state population growth rate"
+                + " from adjusted OMEGA is different (diff is "
+                + str(g_n_SS_adj - g_n_SS)
+                + ") than the steady-"
+                + "state population growth rate from the original"
+                + " OMEGA."
+            )
+        elif np.max(np.absolute(g_n_SS_adj - g_n_SS)) <= 10 ** (-8):
+            print(
+                "SUCCESS: The steady-state population growth rate"
+                + " from adjusted OMEGA is close to (diff is "
+                + str(g_n_SS_adj - g_n_SS)
+                + ") the steady-"
+                + "state population growth rate from the original"
+                + " OMEGA."
+            )
+
+        # Do another test of the adjusted immigration rates. Create the
+        # new OMEGA matrix implied by the new immigration rates. Plug in
+        # the adjusted steady-state population distribution. Hit is with
+        # the new OMEGA transition matrix and it should return the new
+        # steady-state population distribution
+        omega_new = np.dot(OMEGA2, omega_SSfx)
+        omega_errs = np.absolute(omega_new - omega_SSfx)
+        print(
+            "The maximum absolute difference between the adjusted "
+            + "steady-state population distribution and the "
+            + "distribution generated by hitting the adjusted OMEGA "
+            + "transition matrix is "
+            + str(omega_errs.max())
+        )
+
+        # Plot the original immigration rates versus the adjusted
+        # immigration rates
+        immratesmaxdiff = np.absolute(imm_rates_orig - imm_rates_adj).max()
+        print(
+            "The maximum absolute distance between any two points "
+            + "of the original immigration rates and adjusted "
+            + "immigration rates is "
+            + str(immratesmaxdiff)
+        )
+
+        # plots
+        age_per_EpS = np.arange(1, E + S + 1)
+        pp.plot_omega_fixed(
+            age_per_EpS, omega_SS_orig, omega_SSfx, E, S, path=OUTPUT_DIR
+        )
+        pp.plot_imm_fixed(
+            age_per_EpS,
+            imm_rates_orig[fixper - 1, :],
+            imm_rates_adj,
+            E,
+            S,
+            path=OUTPUT_DIR,
+        )
+        pp.plot_population_path(
+            age_per_EpS,
+            omega_path_lev,
+            omega_SSfx,
+            initial_data_year,
+            initial_data_year,
+            initial_data_year,
+            S,
+            path=OUTPUT_DIR,
+        )
+
+    pop_objs = expand_pop_obj_J(
+        omega_path_lev,
+        omega_path_S,
+        omega_SSfx,
+        fert_rates,
+        mort_rates,
+        infmort_rates,
+        imm_rates_full,
+        mort_rates_S,
+        imm_rates_mat,
+        E,
+        S,
+        g_n_SS,
+        fixper,
+        income_percentiles=income_percentiles,
+        fert_gradient=fert_gradient,
+        mort_gradient=mort_gradient,
+        infmort_gradient=infmort_gradient,
+        imm_pctiles=imm_pctiles,
+    )
+
+    # Return objects in a dictionary
+    pop_dict = {
+        "omega": pop_objs["omega_path_S"][1:, :, :],
+        "g_n_ss": g_n_SS,
+        "omega_SS": pop_objs["omega_SS"],
+        "rho": pop_objs["mort_rates_S"][1:, :, :],
+        "g_n": g_n_path[1:],
+        "imm_rates": pop_objs["imm_rates_mat"][1:, :, :],
+        "omega_S_preTP": pop_objs["omega_path_S"][0, :, :],
+        "imm_rates_preTP": pop_objs["imm_rates_mat"][0, :, :],
+        "rho_preTP": pop_objs["mort_rates_S"][0, :, :],
+        "g_n_preTP": g_n_path[0],
+    }
+
+    return pop_dict

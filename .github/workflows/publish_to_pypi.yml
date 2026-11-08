@@ -1,0 +1,26 @@
+name: Publish package to PyPI
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  deploy:
+    name: Publish to PyPI
+    if: github.repository == 'PSLmodels/OG-Core'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.15"
+      - name: Build package
+        run: uv build
+      - name: Publish a Python distribution to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI }}
+          skip_existing: true

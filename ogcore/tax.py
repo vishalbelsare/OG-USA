@@ -1,121 +1,90 @@
-'''
+"""
 ------------------------------------------------------------------------
 Functions for taxes in the steady state and along the transition path.
 ------------------------------------------------------------------------
-'''
+"""
 
 # Packages
 import numpy as np
-from ogcore import utils
+from ogcore import utils, pensions
 from ogcore.txfunc import get_tax_rates
 
-'''
+"""
 ------------------------------------------------------------------------
     Functions
 ------------------------------------------------------------------------
-'''
+"""
 
 
-def replacement_rate_vals(nssmat, wss, factor_ss, j, p):
-    '''
-    Calculates replacement rate values for the social security system.
-
-    Args:
-        nssmat (Numpy array): initial guess at labor supply, size = SxJ
-        new_w (scalar): steady state real wage rate
-        factor_ss (scalar): scaling factor converting model units to
-            dollars
-        j (int): index of lifetime income group
-        p (OG-Core Specifications object): model parameters
-
-    Returns:
-        theta (Numpy array): social security replacement rate value for
-            lifetime income group j
-
-    '''
-    if j is not None:
-        e = p.e[:, j]
-    else:
-        e = p.e
-    # adjust number of calendar years AIME computed from int model periods
-    equiv_periods = int(round((p.S / 80.0) * p.AIME_num_years)) - 1
-    if e.ndim == 2:
-        dim2 = e.shape[1]
-    else:
-        dim2 = 1
-    earnings = (e * (wss * nssmat * factor_ss)).reshape(p.S, dim2)
-    # get highest earning years for number of years AIME computed from
-    highest_earn =\
-        (-1.0 * np.sort(-1.0 * earnings[:p.retire[-1], :],
-                        axis=0))[:equiv_periods]
-    AIME = highest_earn.sum(0) / ((12.0 * (p.S / 80.0)) * equiv_periods)
-    PIA = np.zeros(dim2)
-    # Compute level of replacement using AIME brackets and PIA rates
-    for j in range(dim2):
-        if AIME[j] < p.AIME_bkt_1:
-            PIA[j] = p.PIA_rate_bkt_1 * AIME[j]
-        elif AIME[j] < p.AIME_bkt_2:
-            PIA[j] = (p.PIA_rate_bkt_1 * p.AIME_bkt_1 +
-                      p.PIA_rate_bkt_2 * (AIME[j] - p.AIME_bkt_1))
-        else:
-            PIA[j] = (p.PIA_rate_bkt_1 * p.AIME_bkt_1 +
-                      p.PIA_rate_bkt_2 * (p.AIME_bkt_2 - p.AIME_bkt_1) +
-                      p.PIA_rate_bkt_3 * (AIME[j] - p.AIME_bkt_2))
-    # Set the maximum monthly replacment rate from SS benefits tables
-    PIA[PIA > p.PIA_maxpayment] = p.PIA_maxpayment
-    if p.PIA_minpayment != 0.0:
-        PIA[PIA < p.PIA_minpayment] = p.PIA_minpayment
-    theta = (PIA * (12.0 * p.S / 80.0)) / (factor_ss * wss)
-    return theta
-
-
-def ETR_wealth(b, h_wealth, m_wealth, p_wealth):
-    r'''
+def ETR_wealth(b, h_wealth, m_wealth, p_wealth, tax_filer):
+    r"""
     Calculates the effective tax rate on wealth.
 
     .. math::
-        T_{j,s,t}^{w} = \frac{h^{w}p_{w}b_{j,s,t}}{h^{w}b_{j,s,t} + m^{w}}
+        \tau_{t}^{etr,w} =
+        p^{w}\left(\frac{h^{w}b_{j,s,t}}{h^{w}b_{j,s,t} + m^{w}}\right)
 
     Args:
         b (Numpy array): savings
         h_wealth (scalar): parameter of wealth tax function
         p_wealth (scalar): parameter of wealth tax function
         m_wealth (scalar): parameter of wealth tax function
+        tax_filer (Numpy array): array indicating tax filer status
 
     Returns:
         tau_w (Numpy array): effective tax rate on wealth, size = SxJ
 
-    '''
+    """
     tau_w = (p_wealth * h_wealth * b) / (h_wealth * b + m_wealth)
+
+    tau_w = tau_w * tax_filer
+    # TODO: figure out how to handle non-filers wih diff j and over time path
+
     return tau_w
 
 
-def MTR_wealth(b, h_wealth, m_wealth, p_wealth):
-    r'''
+def MTR_wealth(b, h_wealth, m_wealth, p_wealth, tax_filer):
+    r"""
     Calculates the marginal tax rate on wealth from the wealth tax.
 
     .. math::
-        \frac{\partial T_{j,s,t}^{w}}{\partial b_{j,s,t}} =
-        \frac{h^{w}m^{w}p_{w}}{(b_{j,s,t}h^{w}m^{w})^{2}}
+        \tau^{mtrw}_{t} = \tau^{etr,w}_{t}
+        \left[2 - \left(\frac{h^w b_{j,s,t}}{h^w b_{j,s,t} + m^w}\right)\right]
 
     Args:
         b (Numpy array): savings
         h_wealth (scalar): parameter of wealth tax function
         p_wealth (scalar): parameter of wealth tax function
         m_wealth (scalar): parameter of wealth tax function
+        tax_filer (Numpy array): array indicating tax filer status
 
     Returns:
         tau_prime (Numpy array): marginal tax rate on wealth, size = SxJ
 
-    '''
-    tau_prime = ((b * h_wealth * m_wealth * p_wealth) /
-                 ((b * h_wealth + m_wealth) ** 2) +
-                 ETR_wealth(b, h_wealth, m_wealth, p_wealth))
+    """
+    tau_prime = ETR_wealth(b, h_wealth, m_wealth, p_wealth, tax_filer) * 2 - (
+        (h_wealth**2 * p_wealth * b**2) / ((b * h_wealth + m_wealth) ** 2)
+    )
+    tau_prime = tau_prime * tax_filer
+    # TODO: figure out how to handle non-filers in TPI when j is None
+
     return tau_prime
 
 
-def ETR_income(r, w, b, n, factor, e, etr_params, p):
-    '''
+def ETR_income(
+    r,
+    w,
+    b,
+    n,
+    factor,
+    e,
+    etr_params,
+    labor_noncompliance_rate,
+    capital_noncompliance_rate,
+    tax_filer,
+    p,
+):
+    """
     Calculates effective personal income tax rate.
 
     Args:
@@ -126,25 +95,49 @@ def ETR_income(r, w, b, n, factor, e, etr_params, p):
         factor (scalar): scaling factor converting model units to
             dollars
         e (Numpy array): effective labor units
-        etr_params (Numpy array): effective tax rate function parameters
+        etr_params (list): list of effective tax rate function
+            parameters or nonparametric function
+        labor_noncompliance_rate (Numpy array): income tax noncompliance
+            rate for labor income
+        capital_noncompliance_rate (Numpy array): income tax
+            noncompliance rate for capital income
+        tax_filer (Numpy array): array indicating tax filer status
         p (OG-Core Specifications object): model parameters
 
     Returns:
         tau (Numpy array): effective tax rate on total income
 
-    '''
+    """
     X = (w * e * n) * factor
     Y = (r * b) * factor
+    noncompliance_rate = (
+        (X * labor_noncompliance_rate) + (Y * capital_noncompliance_rate)
+    ) / (X + Y)
 
-    tau = get_tax_rates(etr_params, X, Y, None, p.tax_func_type, 'etr',
-                        for_estimation=False)
+    tau = get_tax_rates(
+        etr_params, X, Y, None, p.tax_func_type, "etr", for_estimation=False
+    )
+
+    tau = tau * (1 - noncompliance_rate) * tax_filer
 
     return tau
 
 
-def MTR_income(r, w, b, n, factor, mtr_capital, e, etr_params,
-               mtr_params, p):
-    r'''
+def MTR_income(
+    r,
+    w,
+    b,
+    n,
+    factor,
+    mtr_capital,
+    e,
+    etr_params,
+    mtr_params,
+    noncompliance_rate,
+    tax_filer,
+    p,
+):
+    r"""
     Generates the marginal tax rate on labor income for households.
 
     Args:
@@ -157,58 +150,128 @@ def MTR_income(r, w, b, n, factor, mtr_capital, e, etr_params,
         mtr_capital (bool): whether to compute the marginal tax rate on
             capital income or labor income
         e (Numpy array): effective labor units
-        etr_params (Numpy array): effective tax rate function parameters
+        etr_params (list): list of effective tax rate function
+            parameters or nonparametric function
+        mtr_params (list): list of marginal tax rate function
+            parameters or nonparametric function
+        noncompliance_rate (Numpy array): income tax noncompliance rate
+        tax_filer (Numpy array): array indicating tax filer status
         p (OG-Core Specifications object): model parameters
 
     Returns:
         tau (Numpy array): marginal tax rate on income source
 
-    '''
+    """
     X = (w * e * n) * factor
     Y = (r * b) * factor
 
     if p.analytical_mtrs:
         tau = get_tax_rates(
-            etr_params, X, Y, None, p.tax_func_type, 'mtr',
-            p.analytical_mtrs, mtr_capital, for_estimation=False)
+            etr_params,
+            X,
+            Y,
+            None,
+            p.tax_func_type,
+            "mtr",
+            p.analytical_mtrs,
+            mtr_capital,
+            for_estimation=False,
+        )
     else:
         tau = get_tax_rates(
-            mtr_params, X, Y, None, p.tax_func_type, 'mtr',
-            p.analytical_mtrs, mtr_capital, for_estimation=False)
+            mtr_params,
+            X,
+            Y,
+            None,
+            p.tax_func_type,
+            "mtr",
+            p.analytical_mtrs,
+            mtr_capital,
+            for_estimation=False,
+        )
+
+    tau = tau * (1 - noncompliance_rate) * tax_filer
 
     return tau
 
 
-def get_biz_tax(w, Y, L, K, p, method):
-    r'''
+def get_biz_tax(w, Y, L, K, p_m, p, m, method):
+    r"""
     Finds total business income tax revenue.
 
     .. math::
-        R_{t}^{b} = \tau_{t}^{b}(Y_{t} - w_{t}L_{t}) -
-        \tau_{t}^{b}\delta_{t}^{\tau}K_{t}^{\tau}
-    Args:
-        r (array_like): real interest rate
-        Y (array_like): aggregate output
-        L (array_like): aggregate labor demand
-        K (array_like): aggregate capital demand
+        R_{t}^{b} = \sum_{m=1}^{M}\tau_{m,t}^{b}(Y_{m,t} - w_{t}L_{m,t}) -
+        \tau_{m,t}^{b}\delta_{m,t}^{\tau}K_{m,t}^{\tau}
+        - \tau^{inv}_{m,t}I_{m,t}
 
+    Args:
+        w (array_like): wage
+        Y (array_like): aggregate output for each industry
+        L (array_like): aggregate labor demand for each industry
+        K (array_like): aggregate capital demand for each industry
+        p_m (array_like): output prices
+        p (OG-Core Specifications object): model parameters
+        m (int or None): index for production industry, if None, then
+            compute for all industries
     Returns:
         business_revenue (array_like): aggregate business tax revenue
 
-    '''
-    if method == 'SS':
-        delta_tau = p.delta_tau[-1]
-        tau_b = p.tau_b[-1]
+    """
+    if m is not None:
+        if method == "SS":
+            delta_tau = p.delta_tau[-1, m]
+            tau_b = p.tau_b[-1, m]
+            tau_inv = p.inv_tax_credit[-1, m]
+            price = p_m[m]
+            Inv = p.delta * K[m]  # compute gross investment
+        else:
+            delta_tau = p.delta_tau[: p.T, m].reshape(p.T)
+            tau_b = p.tau_b[: p.T, m].reshape(p.T)
+            tau_inv = p.inv_tax_credit[: p.T, m].reshape(p.T)
+            price = p_m[: p.T, m].reshape(p.T)
+            w = w.reshape(p.T)
+            Inv = p.delta * K
     else:
-        delta_tau = p.delta_tau[:p.T]
-        tau_b = p.tau_b[:p.T]
-    business_revenue = tau_b * (Y - w * L) - tau_b * delta_tau * K
+        if method == "SS":
+            delta_tau = p.delta_tau[-1, :]
+            tau_b = p.tau_b[-1, :]
+            tau_inv = p.inv_tax_credit[-1, :]
+            price = p_m
+            Inv = p.delta * K
+        else:
+            delta_tau = p.delta_tau[: p.T, :].reshape(p.T, p.M)
+            tau_b = p.tau_b[: p.T, :].reshape(p.T, p.M)
+            tau_inv = p.inv_tax_credit[: p.T, :].reshape(p.T, p.M)
+            price = p_m[: p.T, :].reshape(p.T, p.M)
+            w = w.reshape(p.T, 1)
+            Inv = p.delta * K
+
+    business_revenue = (
+        tau_b * (price * Y - w * L) - tau_b * delta_tau * K - tau_inv * Inv
+    )
     return business_revenue
 
 
-def net_taxes(r, w, b, n, bq, factor, tr, ubi, theta, t, j, shift, method,
-              e, etr_params, p):
-    '''
+def net_taxes(
+    r,
+    w,
+    b,
+    n,
+    bq,
+    factor,
+    tr,
+    ubi,
+    theta,
+    t,
+    j,
+    shift,
+    method,
+    e,
+    etr_params,
+    p,
+    ndc_rates=None,
+):
+    """
     Calculate net taxes paid for each household.
 
     Args:
@@ -230,25 +293,31 @@ def net_taxes(r, w, b, n, bq, factor, tr, ubi, theta, t, j, shift, method,
         method (str): adjusts calculation dimensions based on 'SS' or
             'TPI'
         e (Numpy array): effective labor units
-        etr_params (Numpy array): effective tax rate function parameters
+        etr_params (list): list of effective tax rate function parameters
         p (OG-Core Specifications object): model parameters
+        ndc_rates (NDCRates): calendar paths of the NDC credited and
+            discount rates (``pensions.ndc_rates_path``); None for the
+            steady-state rates
 
     Returns:
         net_tax (Numpy array): net taxes paid for each household
 
-    '''
+    """
     T_I = income_tax_liab(r, w, b, n, factor, t, j, method, e, etr_params, p)
-    pension = pension_amount(w, n, theta, t, j, shift, method, e, p)
+    pension = pensions.pension_amount(
+        r, w, n, ndc_rates, theta, t, j, shift, method, e, factor, p
+    )
     T_BQ = bequest_tax_liab(r, b, bq, t, j, method, p)
     T_W = wealth_tax_liab(r, b, t, j, method, p)
-
+    # print("Net taxes shapes = ", T_I.shape, pension.shape,
+    #        T_BQ.shape, T_W.shape)
     net_tax = T_I - pension + T_BQ + T_W - tr - ubi
 
     return net_tax
 
 
 def income_tax_liab(r, w, b, n, factor, t, j, method, e, etr_params, p):
-    '''
+    """
     Calculate income and payroll tax liability for each household
 
     Args:
@@ -263,123 +332,133 @@ def income_tax_liab(r, w, b, n, factor, t, j, method, e, etr_params, p):
         method (str): adjusts calculation dimensions based on 'SS' or
             'TPI'
         e (Numpy array): effective labor units
-        etr_params (Numpy array): effective tax rate function parameters
+        etr_params (list): effective tax rate function parameters
         p (OG-Core Specifications object): model parameters
 
     Returns:
         T_I (Numpy array): total income and payroll taxes paid for each
             household
 
-    '''
+    """
     if j is not None:
-        if method == 'TPI':
+        if method == "TPI":
+            length = r.shape[0]
             if b.ndim == 2:
                 r = r.reshape(r.shape[0], 1)
                 w = w.reshape(w.shape[0], 1)
+                labor_income_tax_compliance_rate = (
+                    p.labor_income_tax_noncompliance_rate[
+                        t : t + length, j
+                    ].reshape(length, 1)
+                )
+                capital_income_tax_compliance_rate = (
+                    p.capital_income_tax_noncompliance_rate[
+                        t : t + length, j
+                    ].reshape(length, 1)
+                )
+                tax_filer = p.income_tax_filer[t : t + length, j].reshape(
+                    length, 1
+                )
+                tau_payroll = p.tau_payroll[t : t + length, j].reshape(
+                    length, 1
+                )
+            else:
+                labor_income_tax_compliance_rate = (
+                    p.labor_income_tax_noncompliance_rate[t : t + length, j]
+                )
+                capital_income_tax_compliance_rate = (
+                    p.capital_income_tax_noncompliance_rate[t : t + length, j]
+                )
+                tax_filer = p.income_tax_filer[t : t + length, j]
+                tau_payroll = p.tau_payroll[t : t + length, j]
+        elif method == "TPI_scalar":
+            labor_income_tax_compliance_rate = (
+                p.labor_income_tax_noncompliance_rate[0, j]
+            )
+            capital_income_tax_compliance_rate = (
+                p.capital_income_tax_noncompliance_rate[0, j]
+            )
+            tax_filer = p.income_tax_filer[0, j]
+            tau_payroll = p.tau_payroll[0, j]
+        else:
+            labor_income_tax_compliance_rate = (
+                p.labor_income_tax_noncompliance_rate[-1, j]
+            )
+            capital_income_tax_compliance_rate = (
+                p.capital_income_tax_noncompliance_rate[-1, j]
+            )
+            tax_filer = p.income_tax_filer[-1, j]
+            tau_payroll = p.tau_payroll[-1, j]
     else:
-        if method == 'TPI':
+        if method == "TPI":
             r = utils.to_timepath_shape(r)
             w = utils.to_timepath_shape(w)
-
+            length = r.shape[0]
+            labor_income_tax_compliance_rate = (
+                p.labor_income_tax_noncompliance_rate[
+                    t : t + length, :
+                ].reshape(length, 1, p.J)
+            )
+            capital_income_tax_compliance_rate = (
+                p.capital_income_tax_noncompliance_rate[
+                    t : t + length, :
+                ].reshape(length, 1, p.J)
+            )
+            tax_filer = p.income_tax_filer[t : t + length, :].reshape(
+                length, 1, p.J
+            )
+            tau_payroll = p.tau_payroll[t : t + length, :].reshape(
+                length, 1, p.J
+            )
+        elif method == "TPI_scalar":
+            labor_income_tax_compliance_rate = (
+                p.labor_income_tax_noncompliance_rate[0, :]
+            )
+            capital_income_tax_compliance_rate = (
+                p.capital_income_tax_noncompliance_rate[0, :]
+            )
+            tax_filer = p.income_tax_filer[0, :]
+            tau_payroll = p.tau_payroll[0, :]
+        else:
+            labor_income_tax_compliance_rate = (
+                p.labor_income_tax_noncompliance_rate[-1, :]
+            )
+            capital_income_tax_compliance_rate = (
+                p.capital_income_tax_noncompliance_rate[-1, :]
+            )
+            tax_filer = p.income_tax_filer[-1, :]
+            tau_payroll = p.tau_payroll[-1, :]
     income = r * b + w * e * n
     labor_income = w * e * n
-    T_I = ETR_income(r, w, b, n, factor, e, etr_params, p) * income
-    if method == 'SS':
-        T_P = p.tau_payroll[-1] * labor_income
-    elif method == 'TPI':
-        length = w.shape[0]
-        if len(b.shape) == 1:
-            T_P = p.tau_payroll[t: t + length] * labor_income
-        elif len(b.shape) == 2:
-            T_P = (p.tau_payroll[t: t + length].reshape(length, 1) *
-                   labor_income)
-        else:
-            T_P = (p.tau_payroll[t:t + length].reshape(length, 1, 1) *
-                   labor_income)
-    elif method == 'TPI_scalar':
-        T_P = p.tau_payroll[0] * labor_income
+
+    T_I = (
+        ETR_income(
+            r,
+            w,
+            b,
+            n,
+            factor,
+            e,
+            etr_params,
+            labor_income_tax_compliance_rate,
+            capital_income_tax_compliance_rate,
+            tax_filer,
+            p,
+        )
+        * income
+    )
+
+    # Linear payroll tax, with a rate that may vary over time and by
+    # lifetime income group j (tau_payroll is T+S x J)
+    T_P = tau_payroll * labor_income
 
     income_payroll_tax_liab = T_I + T_P
 
     return income_payroll_tax_liab
 
 
-def pension_amount(w, n, theta, t, j, shift, method, e, p):
-    '''
-    Calculate public pension benefit amounts for each household.
-
-    Args:
-        w (array_like): real wage rate
-        n (Numpy array): labor supply
-        theta (Numpy array): social security replacement rate value for
-            lifetime income group j
-        t (int): time period
-        j (int): index of lifetime income group
-        shift (bool): whether computing for periods 0--s or 1--(s+1),
-            =True for 1--(s+1)
-        method (str): adjusts calculation dimensions based on 'SS' or
-            'TPI'
-        e (Numpy array): effective labor units
-        p (OG-Core Specifications object): model parameters
-
-    Returns:
-        pension (Numpy array): pension amount for each household
-
-    '''
-    if j is not None:
-        if method == 'TPI':
-            if n.ndim == 2:
-                w = w.reshape(w.shape[0], 1)
-    else:
-        if method == 'TPI':
-            w = utils.to_timepath_shape(w)
-
-    pension = np.zeros_like(n)
-    if method == 'SS':
-        # Depending on if we are looking at b_s or b_s+1, the
-        # entry for retirement will change (it shifts back one).
-        # The shift boolean makes sure we start replacement rates
-        # at the correct age.
-        if shift is False:
-            pension[p.retire[-1]:] = theta * w
-        else:
-            pension[p.retire[-1] - 1:] = theta * w
-    elif method == 'TPI':
-        length = w.shape[0]
-        if not shift:
-            # retireTPI is different from retire, because in TP income
-            # we are counting backwards with different length lists.
-            # This will always be the correct location of retirement,
-            # depending on the shape of the lists.
-            retireTPI = (p.retire[t: t + length] - p.S)
-        else:
-            retireTPI = (p.retire[t: t + length] - 1 - p.S)
-        if len(n.shape) == 1:
-            if not shift:
-                retireTPI = p.retire[t] - p.S
-            else:
-                retireTPI = p.retire[t] - 1 - p.S
-            pension[retireTPI:] = (
-                theta[j] * p.replacement_rate_adjust[t] * w[retireTPI:])
-        elif len(n.shape) == 2:
-            for tt in range(pension.shape[0]):
-                pension[tt, retireTPI[tt]:] = (
-                    theta * p.replacement_rate_adjust[t + tt] * w[tt])
-        else:
-            for tt in range(pension.shape[0]):
-                pension[tt, retireTPI[tt]:, :] = (
-                    theta.reshape(1, p.J) *
-                    p.replacement_rate_adjust[t + tt] * w[tt])
-    elif method == 'TPI_scalar':
-        # The above methods won't work if scalars are used.  This option
-        # is only called by the SS_TPI_firstdoughnutring function in TPI.
-        pension = theta * p.replacement_rate_adjust[0] * w
-
-    return pension
-
-
 def wealth_tax_liab(r, b, t, j, method, p):
-    '''
+    """
     Calculate wealth tax liability for each household.
 
     Args:
@@ -394,42 +473,78 @@ def wealth_tax_liab(r, b, t, j, method, p):
     Returns:
         T_W (Numpy array): wealth tax liability for each household
 
-    '''
+    """
     if j is not None:
-        if method == 'TPI':
+        if method == "TPI":
             if b.ndim == 2:
                 r = r.reshape(r.shape[0], 1)
+            tax_filer = p.wealth_tax_filer[:, j]  # TODO check this
+        else:
+            tax_filer = p.wealth_tax_filer[-1, j]
     else:
-        if method == 'TPI':
+        if method == "TPI":
             r = utils.to_timepath_shape(r)
+            tax_filer = p.wealth_tax_filer[:, :]
+        elif method == "TPI_scalar":
+            tax_filer = p.tax_filer[t, :]
+        elif method == "SS":
+            tax_filer = p.wealth_tax_filer[-1, :]
 
-    if method == 'SS':
-        T_W = (ETR_wealth(b, p.h_wealth[-1], p.m_wealth[-1],
-                          p.p_wealth[-1]) * b)
-    elif method == 'TPI':
+    if method == "SS":
+        T_W = (
+            ETR_wealth(
+                b, p.h_wealth[-1], p.m_wealth[-1], p.p_wealth[-1], tax_filer
+            )
+            * b
+        )
+    elif method == "TPI":
         length = r.shape[0]
         if len(b.shape) == 1:
-            T_W = (ETR_wealth(b, p.h_wealth[t:t + length],
-                              p.m_wealth[t:t + length],
-                              p.p_wealth[t:t + length]) * b)
+            T_W = (
+                ETR_wealth(
+                    b,
+                    p.h_wealth[t : t + length],
+                    p.m_wealth[t : t + length],
+                    p.p_wealth[t : t + length],
+                    tax_filer[t : t + length],
+                )
+                * b
+            )
         elif len(b.shape) == 2:
-            T_W = (ETR_wealth(b, p.h_wealth[t:t + length],
-                              p.m_wealth[t:t + length],
-                              p.p_wealth[t:t + length]) * b)
+            T_W = (
+                ETR_wealth(
+                    b,
+                    p.h_wealth[t : t + length],
+                    p.m_wealth[t : t + length],
+                    p.p_wealth[t : t + length],
+                    tax_filer[t : t + length],
+                )
+                * b
+            )
         else:
-            T_W = (ETR_wealth(
-                b, p.h_wealth[t:t + length].reshape(length, 1, 1),
-                p.m_wealth[t:t + length].reshape(length, 1, 1),
-                p.p_wealth[t:t + length].reshape(length, 1, 1)) * b)
-    elif method == 'TPI_scalar':
-        T_W = (ETR_wealth(b, p.h_wealth[0], p.m_wealth[0],
-                          p.p_wealth[0]) * b)
+            T_W = (
+                ETR_wealth(
+                    b,
+                    p.h_wealth[t : t + length].reshape(length, 1, 1),
+                    p.m_wealth[t : t + length].reshape(length, 1, 1),
+                    p.p_wealth[t : t + length].reshape(length, 1, 1),
+                    tax_filer[t : t + length, :].reshape(length, 1, p.J),
+                )
+                * b
+            )
+    elif method == "TPI_scalar":
+        T_W = (
+            ETR_wealth(
+                b, p.h_wealth[0], p.m_wealth[0], p.p_wealth[0], tax_filer
+            )
+            * b
+        )
 
     return T_W
 
 
 def bequest_tax_liab(r, b, bq, t, j, method, p):
-    '''
+    """
     Calculate liability due from taxes on bequests for each household.
 
     Args:
@@ -445,30 +560,61 @@ def bequest_tax_liab(r, b, bq, t, j, method, p):
     Returns:
         T_BQ (Numpy array): bequest tax liability for each household
 
-    '''
+    """
     if j is not None:
         lambdas = p.lambdas[j]
-        if method == 'TPI':
+        if method == "TPI":
             if b.ndim == 2:
                 r = r.reshape(r.shape[0], 1)
     else:
         lambdas = np.transpose(p.lambdas)
-        if method == 'TPI':
+        if method == "TPI":
             r = utils.to_timepath_shape(r)
 
-    if method == 'SS':
+    if method == "SS":
         T_BQ = p.tau_bq[-1] * bq
-    elif method == 'TPI':
+    elif method == "TPI":
         length = r.shape[0]
         if len(b.shape) == 1:
-            T_BQ = p.tau_bq[t:t + length] * bq
+            T_BQ = p.tau_bq[t : t + length] * bq
         elif len(b.shape) == 2:
-            T_BQ = p.tau_bq[t:t + length].reshape(length, 1) * bq / lambdas
+            T_BQ = p.tau_bq[t : t + length].reshape(length, 1) * bq / lambdas
         else:
-            T_BQ = p.tau_bq[t:t + length].reshape(length, 1, 1) * bq
-    elif method == 'TPI_scalar':
+            T_BQ = p.tau_bq[t : t + length].reshape(length, 1, 1) * bq
+    elif method == "TPI_scalar":
         # The above methods won't work if scalars are used.  This option
         # is only called by the SS_TPI_firstdoughnutring function in TPI.
         T_BQ = p.tau_bq[0] * bq
 
     return T_BQ
+
+
+def cons_tax_liab(c, p_i, p, method="SS"):
+    """
+    Calculates consumption tax liability for each household.
+
+    Args:
+        c (numpy.ndarray): Consumption array. Dimensions depend on the method:
+            - If method == "SS": shape (I, S, J)
+            - If method != "SS": shape (T, I, S, J)
+        p_i (numpy.ndarray): Array of consumption tax rates by good.
+            Shape (I,) or (T, I).
+        p (OG-Core Specifications object): Model parameters, including
+            tax rates and dimensions.
+        method (str, optional): Indicates whether calculation is for
+            steady-state ('SS') or transition path ('TPI').
+            Default is 'SS'.
+
+    Returns:
+        c_tax (numpy.ndarray): Consumption tax liability for each household.
+            - If method == "SS": shape (S, J)
+            - If method != "SS": shape (T, S, J)
+    """
+    if method == "SS":
+        c_tax = ((p.tau_c[-1, :] * p_i).reshape(p.I, 1, 1) * c).sum(axis=0)
+    else:
+        c_tax = (
+            (p.tau_c[: p.T, :] * p_i[: p.T, :]).reshape(p.T, p.I, 1, 1) * c
+        ).sum(axis=1)
+
+    return c_tax

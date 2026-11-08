@@ -1,32 +1,163 @@
+"""
+Time path iteration (TPI) module for OG-Core.
+
+This module contains the following functions:
+    get_initial_SS_values()
+    firstdoughnutring()
+    twist_doughnut()
+    inner_loop()
+    run_TPI()
+"""
+
 # imports
 import numpy as np
 import pickle
 import scipy.optimize as opt
-from dask import delayed, compute
-import dask.multiprocessing
-from ogcore import tax, utils, household, firm, fiscal
+from scipy.sparse import csr_matrix
+from ogcore import tax, utils, household, firm, fiscal, pensions, solvers
 from ogcore import aggregates as aggr
 from ogcore.constants import SHOW_RUNTIME
 import os
+import uuid
 import warnings
+import logging
+from distributed import wait
 
+# ``approx_derivative`` and ``group_columns`` live in a private scipy module
+# (scipy.optimize._numdiff). Guard the import so a future scipy change disables
+# the optional sparse-FOC-Jacobian path -- falling back to dense finite
+# differences -- instead of breaking TPI entirely.
+try:
+    from scipy.optimize._numdiff import approx_derivative, group_columns
+
+    _HAVE_SPARSE_FD = True
+except Exception:  # pragma: no cover
+    approx_derivative = None
+    group_columns = None
+    _HAVE_SPARSE_FD = False
+
+logger = logging.getLogger(__name__)
 
 if not SHOW_RUNTIME:
     warnings.simplefilter("ignore", RuntimeWarning)
 
-'''
+"""
 Set minimizer tolerance
-'''
+"""
 MINIMIZER_TOL = 1e-13
 
-'''
+"""
 Set flag for enforcement of solution check
-'''
+"""
 ENFORCE_SOLUTION_CHECKS = True
 
 
+# Cache of detected sparsity patterns, keyed by (function name, problem
+# size) and scoped to a single run_TPI call (see _BANDED_JAC_SCOPE): the
+# pattern depends on the parameterization, e.g. a Defined Benefits pension
+# couples retirement-age conditions to working-age labor, so a pattern
+# detected for an earlier run in this process, or on a long-lived dask
+# worker, must not be reused for a later one.
+_BANDED_JAC_CACHE = {}
+_BANDED_JAC_SCOPE = None
+
+
+def _detect_jac_sparsity(fun, x0, args, scope=None, thr_rel=1e-9):
+    """Auto-detect the Jacobian sparsity of `fun` near x0 and return a
+    (csr_pattern, groups) coloring for sparse finite differences, or None if
+    the Jacobian is too dense to benefit (caller then uses plain dense FD).
+
+    One-time per problem dimension within a run (cached; the cache is
+    emptied when ``scope`` changes). The pattern is unioned over two
+    nearby points so a coupling that happens to vanish at one point is not
+    missed. Portable across countries/calibrations/pensions: it reads the
+    *actual* structure each run rather than assuming a stencil, so a
+    history-dependent pension (dense columns) is detected automatically and
+    falls back to dense finite differences.
+
+    Args:
+        fun (function): the residual function whose Jacobian is probed
+        x0 (array_like): point at which to probe the sparsity
+        args (tuple): extra arguments passed to ``fun``
+        scope (hashable or None): identifier of the run the pattern
+            belongs to (``p._jac_cache_scope``, set by ``run_TPI``);
+            cached patterns from a different scope are discarded
+        thr_rel (float): relative threshold below which an entry is treated
+            as a structural zero
+
+    Returns:
+        result (tuple or None): ``(csr_pattern, groups)`` coloring for sparse
+            finite differences, or None if the Jacobian is not sparse enough
+            to benefit
+    """
+    global _BANDED_JAC_SCOPE
+    if scope != _BANDED_JAC_SCOPE:
+        _BANDED_JAC_CACHE.clear()
+        _BANDED_JAC_SCOPE = scope
+    n = len(x0)
+    key = (getattr(fun, "__name__", repr(fun)), n)
+    cached = _BANDED_JAC_CACHE.get(key, "miss")
+    if cached != "miss":
+        return cached
+    result = None
+    try:
+        x = np.asarray(x0, dtype=float)
+        mask = np.zeros((n, n), dtype=bool)
+        for xp in (x, x * 1.05 + 0.01):
+            Jd = approx_derivative(fun, xp, args=args, method="2-point")
+            sc = max(float(np.max(np.abs(Jd))), 1e-300)
+            mask |= np.abs(Jd) > thr_rel * sc
+        P = csr_matrix(mask.astype(int))
+        groups = group_columns(P)
+        if int(groups.max()) + 1 < n // 2:
+            result = (P, groups)
+        # else: pattern not sparse enough to benefit (expected at small
+        # firstdoughnutring dims); silently return None so the caller uses
+        # dense FD without surfacing a noisy notice.
+    except Exception:
+        result = None
+    _BANDED_JAC_CACHE[key] = result
+    return result
+
+
+def _banded_jac_for(fun, x0, args, enabled):
+    """Return a sparse finite-difference `jac` callable for ``opt.root`` when
+    ``enabled`` (``p.use_sparse_FOC_jac``) and the Jacobian is sparse enough to
+    benefit; otherwise None, so the caller uses the default dense solver. Used
+    at the household full-lifetime and triangle root-finds.
+
+    Args:
+        fun (function): the residual function passed to ``opt.root``
+        x0 (array_like): initial guess for the root-find
+        args (tuple): extra arguments passed to ``fun``
+        enabled (bool): value of ``p.use_sparse_FOC_jac``
+
+    Returns:
+        _jac (function or None): a callable returning the dense Jacobian built
+            by sparse finite differences, or None to use dense finite
+            differences
+    """
+    if not enabled or not _HAVE_SPARSE_FD:
+        return None
+    # the parameters object is the last element of args at both call sites
+    p = args[-1]
+    bj = _detect_jac_sparsity(
+        fun, x0, args, scope=getattr(p, "_jac_cache_scope", None)
+    )
+    if bj is None:
+        return None
+    P, groups = bj
+
+    def _jac(_x, *_a):
+        return approx_derivative(
+            fun, _x, args=_a, method="2-point", sparsity=(P, groups)
+        ).toarray()
+
+    return _jac
+
+
 def get_initial_SS_values(p):
-    '''
+    """
     Get values of variables for the initial period and the steady state
     equilibrium values.
 
@@ -37,77 +168,156 @@ def get_initial_SS_values(p):
         (tuple): initial period and steady state values:
 
             * initial_values (tuple): initial period variable values,
-                (b_sinit, b_splus1init, factor, initial_b, initial_n)
+                (B0, b_sinit, b_splus1init, factor, initial_n), where
+                B0 is aggregate household wealth and b_sinit and
+                b_splus1init the S x J wealth held and savings chosen in
+                the initial period
             * ss_vars (dictionary): dictionary with steady state
                 solution results
             * theta (Numpy array): steady-state retirement replacement
                 rates, length J
-            * baseline_values (tuple): (TRbaseline, Gbaseline,
-                D0_baseline), lump sum transfer and government spending
-                amounts from the baseline model run
+            * baseline_values (tuple): (Ybaseline, TRbaseline, Gbaseline,
+                Ig_baseline, FAbaseline, D0_baseline, Kg0_baseline), GDP,
+                lump sum transfer, government spending, infrastructure
+                investment, and foreign aid paths and initial government
+                debt and public capital from the baseline model run
 
-    '''
+    """
     baseline_ss = os.path.join(p.baseline_dir, "SS", "SS_vars.pkl")
     ss_baseline_vars = utils.safe_read_pickle(baseline_ss)
-    factor = ss_baseline_vars['factor_ss']
-    B0 = aggr.get_B(ss_baseline_vars['bssmat_splus1'], p, 'SS', True)
-    initial_b = (ss_baseline_vars['bssmat_splus1'] *
-                 (ss_baseline_vars['Bss'] / B0))
-    initial_n = ss_baseline_vars['nssmat']
+    factor = ss_baseline_vars["factor"]
+    # Initial distribution of savings, b_sp1 chosen at age s and held at
+    # s+1, scaled so that aggregate household wealth evaluated with the
+    # period-0 population equals the steady-state aggregate. Its shape is
+    # the steady-state distribution unless initial_hhwealth_dist (an S x J
+    # matrix of shares of aggregate wealth) is given. When
+    # initial_wealth_ratio is given, the level is revised inside run_TPI
+    # so that initial wealth is that ratio times initial GDP.
+    B0 = aggr.get_B(ss_baseline_vars["b_sp1"], p, "SS", True)
+    if p.initial_hhwealth_dist is None:
+        initial_b_sp1 = ss_baseline_vars["b_sp1"] * (
+            ss_baseline_vars["B"] / B0
+        )
+    else:
+        initial_b_sp1_prelim = (
+            p.initial_hhwealth_dist * ss_baseline_vars["B"]
+        ) / p.omega[0, :, :]
+        initial_b_sp1 = initial_b_sp1_prelim * (
+            ss_baseline_vars["B"]
+            / aggr.get_B(initial_b_sp1_prelim, p, "SS", True)
+        )
+    initial_b = np.zeros((p.S, p.J))
+    initial_b[1:, :] = initial_b_sp1[:-1, :]
+    initial_n = ss_baseline_vars["n"]
+    # The DB/NDC/PS pension formulas need the labor supplied before the
+    # time path begins by cohorts alive at t=0. Use the model's initial
+    # labor condition (the same baseline object that initializes wealth);
+    # pre-time-path wages are anchored to the period-0 wage of the
+    # current path inside pensions.py. See Issue #1014 for a fully
+    # history-consistent treatment.
+    p.n_preTP = initial_n
+
+    Ybaseline = None
     TRbaseline = None
     Gbaseline = None
     Ig_baseline = None
-    if p.baseline_spending:
-        baseline_tpi = os.path.join(
-            p.baseline_dir, "TPI", "TPI_vars.pkl")
+    FAbaseline = None
+    if not p.baseline:
+        baseline_tpi = os.path.join(p.baseline_dir, "TPI", "TPI_vars.pkl")
         tpi_baseline_vars = utils.safe_read_pickle(baseline_tpi)
-        TRbaseline = tpi_baseline_vars['TR']
-        Gbaseline = tpi_baseline_vars['G']
-        Ig_baseline = tpi_baseline_vars['I_g']
+        Ybaseline = tpi_baseline_vars["Y"]
+    if p.baseline_spending:
+        baseline_tpi = os.path.join(p.baseline_dir, "TPI", "TPI_vars.pkl")
+        tpi_baseline_vars = utils.safe_read_pickle(baseline_tpi)
+        TRbaseline = tpi_baseline_vars["TR"]
+        Gbaseline = tpi_baseline_vars["G"]
+        Ig_baseline = tpi_baseline_vars["I_g"]
+        FAbaseline = utils.get_baseline_foreign_aid(
+            tpi_baseline_vars, p, "TPI"
+        )
 
     if p.baseline:
         ss_vars = ss_baseline_vars
     else:
         reform_ss_path = os.path.join(p.output_base, "SS", "SS_vars.pkl")
         ss_vars = utils.safe_read_pickle(reform_ss_path)
-    theta = ss_vars['theta']
+    theta = ss_vars["theta"]
 
-    '''
+    """
     ------------------------------------------------------------------------
     Set other parameters and initial values
     ------------------------------------------------------------------------
-    '''
+    """
     # Get an initial distribution of wealth with the initial population
     # distribution. When small_open=True, the value of K0 is used as a
     # placeholder for first-period wealth
-    B0 = aggr.get_B(initial_b, p, 'SS', True)
+    B0 = aggr.get_B(initial_b_sp1, p, "SS", True)
 
-    b_sinit = np.array(list(np.zeros(p.J).reshape(1, p.J)) +
-                       list(initial_b[:-1]))
-    b_splus1init = initial_b
+    b_sinit = initial_b.copy()
+    b_splus1init = initial_b_sp1.copy()
 
     # Intial gov't debt and capital stock must match that in the baseline
     if not p.baseline:
-        baseline_tpi = os.path.join(
-            p.baseline_dir, "TPI", "TPI_vars.pkl")
+        baseline_tpi = os.path.join(p.baseline_dir, "TPI", "TPI_vars.pkl")
         tpi_baseline_vars = utils.safe_read_pickle(baseline_tpi)
-        D0_baseline = tpi_baseline_vars['D'][0]
-        Kg0_baseline = tpi_baseline_vars['K_g'][0]
+        if (
+            p.initial_wealth_ratio is not None
+            or p.initial_hhwealth_dist is not None
+        ):
+            # The baseline's initial wealth was set by the initial wealth
+            # parameters (and, for the ratio, solved for along with the
+            # baseline path), so the reform must start from the same
+            # period-0 wealth rather than from the steady-state values.
+            # b_sp1_preTP is the savings chosen before the time path
+            # began (held at t=0); an older baseline pickle without it is
+            # rebuilt from the wealth held at t=0, keeping the current
+            # last row (savings of the oldest cohort, which only enter
+            # period-0 bequests)
+            B0 = tpi_baseline_vars["B"][0]
+            b_sinit = tpi_baseline_vars["b_s"][0, :, :]
+            if "b_sp1_preTP" in tpi_baseline_vars:
+                b_splus1init = tpi_baseline_vars["b_sp1_preTP"]
+            else:
+                b_splus1init = b_splus1init.copy()
+                b_splus1init[:-1, :] = b_sinit[1:, :]
+        D0_baseline = tpi_baseline_vars["D"][0]
+        Kg0_baseline = tpi_baseline_vars["K_g"][0]
     else:
         D0_baseline = None
         Kg0_baseline = None
 
-    initial_values = (B0, b_sinit, b_splus1init, factor, initial_b,
-                      initial_n)
+    initial_values = (B0, b_sinit, b_splus1init, factor, initial_n)
     baseline_values = (
-        TRbaseline, Gbaseline, Ig_baseline, D0_baseline, Kg0_baseline)
+        Ybaseline,
+        TRbaseline,
+        Gbaseline,
+        Ig_baseline,
+        FAbaseline,
+        D0_baseline,
+        Kg0_baseline,
+    )
 
     return initial_values, ss_vars, theta, baseline_values
 
 
-def firstdoughnutring(guesses, r, w, bq, tr, theta, factor, ubi, j, initial_b,
-                      p):
-    '''
+def firstdoughnutring(
+    guesses,
+    r,
+    w,
+    p_tilde,
+    p_i,
+    bq,
+    rm,
+    tr,
+    theta,
+    factor,
+    ubi,
+    j,
+    initial_b,
+    p,
+    ndc_rates=None,
+):
+    """
     Solves the first entries of the upper triangle of the twist doughnut. This
     is separate from the main TPI function because the values of b and n are
     scalars, so it is easier to just have a separate function for these cases.
@@ -116,7 +326,10 @@ def firstdoughnutring(guesses, r, w, bq, tr, theta, factor, ubi, j, initial_b,
         guesses (Numpy array): initial guesses for b and n, length 2
         r (scalar): real interest rate
         w (scalar): real wage rate
+        p_tilde (scalar): composite good price
+        p_i (Numpy array): output goods prices
         bq (scalar): bequest amounts by age
+        rm (scalar): remittance amounts by age
         tr (scalar): government transfer amount
         theta (Numpy array): retirement replacement rates, length J
         factor (scalar): scaling factor converting model units to dollars
@@ -125,33 +338,67 @@ def firstdoughnutring(guesses, r, w, bq, tr, theta, factor, ubi, j, initial_b,
         j (int): index of ability type
         initial_b (Numpy array): SxJ matrix, savings of agents alive at T=0
         p (OG-Core Specifications object): model parameters
+        ndc_rates (NDCRates): calendar paths of the NDC credited and
+            discount rates (``pensions.ndc_rates_path``); None for the
+            steady-state rates
 
     Returns:
         euler errors (Numpy array): errors from first order conditions,
             length 2
 
-    '''
+    """
     b_splus1 = float(guesses[0])
     n = float(guesses[1])
     b_s = float(initial_b[-2, j])
 
     # Find errors from FOC for savings and FOC for labor supply
-    error1 = household.FOC_savings(np.array([r]), np.array([w]), b_s,
-                                   np.array([b_splus1]), np.array([n]),
-                                   np.array([bq]), factor,
-                                   np.array([tr]), np.array([ubi]), theta[j],
-                                   p.e[-1, j], p.rho[-1],
-                                   np.array([p.tau_c[0, -1, j]]),
-                                   p.etr_params[0, -1, :],
-                                   p.mtry_params[0, -1, :], None, j, p,
-                                   'TPI_scalar')
+    error1 = household.FOC_savings(
+        np.array([r]),
+        np.array([w]),
+        np.array([p_tilde]),
+        np.array([p_i]),
+        b_s,
+        np.array([b_splus1]),
+        np.array([n]),
+        np.array([bq]),
+        np.array([rm]),
+        factor,
+        np.array([tr]),
+        np.array([ubi]),
+        theta[j],
+        p.rho[0, -1, j],
+        p.etr_params[0][-1],
+        p.mtry_params[0][-1],
+        None,
+        j,
+        p,
+        "TPI_scalar",
+        ndc_rates,
+    )
 
     error2 = household.FOC_labor(
-        np.array([r]), np.array([w]), b_s, b_splus1, np.array([n]),
-        np.array([bq]), factor, np.array([tr]), np.array([ubi]), theta[j],
-        p.chi_n[-1], p.e[-1, j], np.array([p.tau_c[0, -1, j]]),
-        p.etr_params[0, -1, :], p.mtrx_params[0, -1, :], None, j, p,
-        'TPI_scalar')
+        np.array([r]),
+        np.array([w]),
+        np.array([p_tilde]),
+        np.array([p_i]),
+        b_s,
+        b_splus1,
+        np.array([n]),
+        np.array([bq]),
+        np.array([rm]),
+        factor,
+        np.array([tr]),
+        np.array([ubi]),
+        theta[j],
+        p.chi_n[0, -1],
+        p.etr_params[0][-1],
+        p.mtrx_params[0][-1],
+        None,
+        j,
+        p,
+        "TPI_scalar",
+        ndc_rates,
+    )
 
     if n <= 0 or n >= 1:
         error2 += 1e12
@@ -161,42 +408,68 @@ def firstdoughnutring(guesses, r, w, bq, tr, theta, factor, ubi, j, initial_b,
     return [np.squeeze(error1)] + [np.squeeze(error2)]
 
 
-def twist_doughnut(guesses, r, w, bq, tr, theta, factor, ubi, j, s, t,
-                   tau_c, etr_params, mtrx_params, mtry_params,
-                   initial_b, p):
-    '''
+def twist_doughnut(
+    guesses,
+    r,
+    w,
+    p_tilde,
+    p_i,
+    bq,
+    rm,
+    tr,
+    theta,
+    factor,
+    ubi,
+    j,
+    s,
+    t,
+    etr_params,
+    mtrx_params,
+    mtry_params,
+    initial_b,
+    p,
+    ndc_rates=None,
+):
+    """
     Solves the upper triangle of time path iterations. These are the agents who
     are alive at time T=0 so that we do not solve for their full lifetime (so
     of their life was before the model begins).
 
     Args:
-        guesses (Numpy array): initial guesses for b and n, length 2s
-        r (scalar): real interest rate
-        w (scalar): real wage rate
+        guesses (list): initial guesses for b and n, length 2s
+        r (Numpy array): real interest rate
+        w (Numpy array): real wage rate
+        p_tilde (Numpy array): composite good price
+        p_i (Numpy array): output goods prices
         bq (Numpy array): bequest amounts by age, length s
-        tr (scalar): government transfer amount
-        theta (Numpy array): retirement replacement rates, length J
+        rm (Numpy array): remittance amounts by age, length s
+        tr (Numpy array): government transfer amount
+        theta (scalar): retirement replacement rate for ability type j,
+            before any replacement_rate_adjust scaling
         factor (scalar): scaling factor converting model units to dollars
-        ubi (array): length remaining periods of life UBI payout to household
+        ubi (Numpy array): length remaining periods of life UBI payout
+            to household
         j (int): index of ability type
         s (int): years of life remaining
         t (int): model period
-        tau_c (Numpy array): consumption tax rates, size = sxJ
-        etr_params (Numpy array): ETR function parameters,
-            size = sxsxnum_params
-        mtrx_params (Numpy array): labor income MTR function parameters,
-            size = sxsxnum_params
-        mtry_params (Numpy array): capital income MTR function
-            parameters, size = sxsxnum_params
+        etr_params (list): ETR function parameters,
+            list of lists with size = sxsxnum_params
+        mtrx_params (list): labor income MTR function parameters,
+            list of lists with size = sxsxnum_params
+        mtry_params (list): capital income MTR function
+            parameters, lists of lists with size = sxsxnum_params
         initial_b (Numpy array): savings of agents alive at T=0,
             size = SxJ
         p (OG-Core Specifications object): model parameters
+        ndc_rates (NDCRates): calendar paths of the NDC credited and
+            discount rates (``pensions.ndc_rates_path``); None for the
+            steady-state rates
 
     Returns:
         euler errors (Numpy array): errors from first order conditions,
             length 2s
 
-    '''
+    """
     length = int(len(guesses) / 2)
     b_guess = np.array(guesses[:length])
     n_guess = np.array(guesses[length:])
@@ -204,25 +477,64 @@ def twist_doughnut(guesses, r, w, bq, tr, theta, factor, ubi, j, s, t,
     if length == p.S:
         b_s = np.array([0] + list(b_guess[:-1]))
     else:
-        b_s = np.array([(initial_b[-(s + 3), j])] + list(b_guess[:-1]))
+        b_s = np.array([initial_b[-(s + 3), j]] + list(b_guess[:-1]))
 
     b_splus1 = b_guess
-    w_s = w[t:t + length]
-    r_s = r[t:t + length]
+    w_s = w[t : t + length]
+    r_s = r[t : t + length]
+    p_tilde_s = p_tilde[t : t + length]
+    p_i_s = p_i[t : t + length, :]
     n_s = n_guess
-    chi_n_s = p.chi_n[-length:]
-    e_s = p.e[-length:, j]
-    rho_s = p.rho[-length:]
+    chi_n_s = np.diag(p.chi_n[t : t + p.S, :], max(p.S - length, 0))
+    rho_s = np.diag(p.rho[t : t + p.S, :, j], max(p.S - length, 0))
 
-    error1 = household.FOC_savings(r_s, w_s, b_s, b_splus1, n_s, bq,
-                                   factor, tr, ubi, theta, e_s, rho_s,
-                                   tau_c, etr_params, mtry_params, t,
-                                   j, p, 'TPI')
+    error1 = household.FOC_savings(
+        r_s,
+        w_s,
+        p_tilde_s,
+        p_i_s,
+        b_s,
+        b_splus1,
+        n_s,
+        bq,
+        rm,
+        factor,
+        tr,
+        ubi,
+        theta,
+        rho_s,
+        etr_params,
+        mtry_params,
+        t,
+        j,
+        p,
+        "TPI",
+        ndc_rates,
+    )
 
-    error2 = household.FOC_labor(r_s, w_s, b_s, b_splus1, n_s, bq,
-                                 factor, tr, ubi, theta, chi_n_s, e_s,
-                                 tau_c, etr_params, mtrx_params, t, j,
-                                 p, 'TPI')
+    error2 = household.FOC_labor(
+        r_s,
+        w_s,
+        p_tilde_s,
+        p_i_s,
+        b_s,
+        b_splus1,
+        n_s,
+        bq,
+        rm,
+        factor,
+        tr,
+        ubi,
+        theta,
+        chi_n_s,
+        etr_params,
+        mtrx_params,
+        t,
+        j,
+        p,
+        "TPI",
+        ndc_rates,
+    )
 
     # Check and punish constraint violations
     mask1 = n_guess < 0
@@ -237,8 +549,57 @@ def twist_doughnut(guesses, r, w, bq, tr, theta, factor, ubi, j, s, t,
     return list(error1.flatten()) + list(error2.flatten())
 
 
+def _params_to_array(nested, tax_func_type):
+    """Convert a nested tax-parameter slice to a numpy array.
+
+    For numeric tax functions this lets ``get_tax_rates`` skip a costly
+    per-call list-to-array conversion. ``mono`` and ``mono2D`` store
+    callables rather than numbers, so their nested-list form is returned
+    unchanged.
+    """
+    if tax_func_type in ("mono", "mono2D"):
+        return nested
+    return np.array(nested)
+
+
+def _retry_root_if_failed(solutions, fun, x0, args, p):
+    """
+    Re-solve a household problem with Levenberg-Marquardt when the
+    configured root finder stops short of a root.
+
+    ``hybr`` can return "not making good progress" after a few evaluations
+    when the starting point is far from the solution, which happens for the
+    short partial-lifetime problems of households alive at t=0. In that
+    case ``solutions.x`` is just the initial guess. ``lm`` is more robust
+    from such starting points, so it is tried next and the result with the
+    smaller maximum residual is kept.
+
+    Args:
+        solutions (OptimizeResult): result of the first root-finding call
+        fun (function): the residual function
+        x0 (array_like): the initial guess used in the first call
+        args (tuple): extra arguments passed to ``fun``
+        p (OG-Core Specifications object): model parameters
+
+    Returns:
+        solutions (OptimizeResult): the better of the two results
+    """
+    max_resid = np.abs(solutions.fun).max()
+    if solutions.success and max_resid <= p.mindist_TPI:
+        return solutions
+    retry = opt.root(fun, x0, args=args, method="lm", tol=MINIMIZER_TOL)
+    if np.abs(retry.fun).max() < max_resid:
+        logger.debug(
+            "Household root finder did not converge (max residual "
+            f"{max_resid:.2e}); the Levenberg-Marquardt retry reached "
+            f"{np.abs(retry.fun).max():.2e}"
+        )
+        return retry
+    return solutions
+
+
 def inner_loop(guesses, outer_loop_vars, initial_values, ubi, j, ind, p):
-    '''
+    """
     Given path of economic aggregates and factor prices, solves
     household problem.  This has been termed the inner-loop (in
     contrast to the outer fixed point loop that solves for GE factor
@@ -248,17 +609,19 @@ def inner_loop(guesses, outer_loop_vars, initial_values, ubi, j, ind, p):
         guesses (tuple): initial guesses for b and n, (guesses_b,
             guesses_n)
         outer_loop_vars (tuple): values for factor prices and economic
-            aggregates used in household problem (r, w, r_p, BQ, TR,
-            theta)
+            aggregates used in household problem
+            (r_p, r, w, p_m, BQ, RM, TR, theta), optionally followed by
+            ndc_rates (NDCRates), the calendar paths of the NDC credited
+            and discount rates
+        r_p (Numpy array): real interest rate on household portfolio
         r (Numpy array): real interest rate on private capital
         w (Numpy array): real wage rate
-        r (Numpy array): real interest rate on household portfolio
+        p_m (Numpy array): output goods prices
         BQ (array_like): aggregate bequest amounts
         TR (Numpy array): lump sum transfer amount
         theta (Numpy array): retirement replacement rates, length J
         initial_values (tuple): initial period variable values,
-            (b_sinit, b_splus1init, factor, initial_b, initial_n,
-            D0_baseline)
+            (b_sinit, b_splus1init, factor, initial_n, D0_baseline)
         ubi (array_like): T+S x S x J array time series of UBI transfers in
             model units for each type-j age-s household in every period t
         j (int): index of ability type
@@ -268,113 +631,320 @@ def inner_loop(guesses, outer_loop_vars, initial_values, ubi, j, ind, p):
     Returns:
         (tuple): household solution results:
 
-            * euler_errors (Numpy array): errors from FOCs, size = Tx2S
-            * b_mat (Numpy array): savings amounts, size = TxS
-            * n_mat (Numpy array): labor supply amounts, size = TxS
+            * euler_errors (Numpy array): errors from FOCs, size =
+              (T+S)x2S. Row t holds the period-t residuals by age: the
+              savings FOCs in the first S columns and the labor FOCs in
+              the last S, so that entry [t, s] (or [t, S+s]) lines up
+              with b_mat[t, s] and n_mat[t, s]. This includes the
+              partial-lifetime problems of the households alive at t=0.
+            * b_mat (Numpy array): savings amounts, size = (T+S)xS
+            * n_mat (Numpy array): labor supply amounts, size = (T+S)xS
 
-    '''
-    (K0, b_sinit, b_splus1init, factor, initial_b, initial_n) =\
-        initial_values
+    """
+    K0, b_sinit, b_splus1init, factor, initial_n = initial_values
     guesses_b, guesses_n = guesses
-    r, w, r_p, BQ, TR, theta = outer_loop_vars
+    r_p, r, w, p_m, BQ, RM, TR, theta = outer_loop_vars[:8]
+    ndc_rates = outer_loop_vars[8] if len(outer_loop_vars) > 8 else None
 
+    # compute composite good price
+    p_i = (
+        np.tile(p.io_matrix.reshape(1, p.I, p.M), (p.T + p.S, 1, 1))
+        * np.tile(p_m.reshape(p.T + p.S, 1, p.M), (1, p.I, 1))
+    ).sum(axis=2)
+    p_tilde = aggr.get_ptilde(p_i[:, :], p.tau_c[:, :], p.alpha_c, "TPI")
     # compute bq
-    bq = household.get_bq(BQ, None, p, 'TPI')
+    bq = household.get_bq(BQ, None, p, "TPI")
     # compute tr
-    tr = household.get_tr(TR, None, p, 'TPI')
+    tr = household.get_tr(TR, None, p, "TPI")
+    # compute rm
+    rm = household.get_rm(RM, None, p, "TPI")
 
     # initialize arrays
     b_mat = np.zeros((p.T + p.S, p.S))
     n_mat = np.zeros((p.T + p.S, p.S))
-    euler_errors = np.zeros((p.T, 2 * p.S))
+    # Euler errors are stored in the same (period, age) layout as b_mat
+    # and n_mat, with the savings FOC residuals in the first S columns
+    # and the labor FOC residuals in the last S columns
+    euler_errors = np.zeros((p.T + p.S, 2 * p.S))
 
+    _fdr_x0 = [guesses_b[0, -1], guesses_n[0, -1]]
+    _fdr_args = (
+        r_p[0],
+        w[0],
+        p_tilde[0],
+        p_i[0, :],
+        bq[0, -1, j],
+        rm[0, -1, j],
+        tr[0, -1, j],
+        theta,
+        factor,
+        ubi[0, -1, j],
+        j,
+        b_splus1init,
+        p,
+        ndc_rates,
+    )
     solutions = opt.root(
-        firstdoughnutring, [guesses_b[0, -1], guesses_n[0, -1]],
-        args=(r_p[0], w[0], bq[0, -1, j], tr[0, -1, j],
-              theta * p.replacement_rate_adjust[0], factor, ubi[0, -1, j],
-              j, initial_b, p), method=p.FOC_root_method, tol=MINIMIZER_TOL)
+        firstdoughnutring,
+        _fdr_x0,
+        args=_fdr_args,
+        method=p.FOC_root_method,
+        tol=MINIMIZER_TOL,
+    )
+    solutions = _retry_root_if_failed(
+        solutions, firstdoughnutring, _fdr_x0, _fdr_args, p
+    )
     b_mat[0, -1], n_mat[0, -1] = solutions.x[0], solutions.x[1]
+    euler_errors[0, p.S - 1] = solutions.fun[0]
+    euler_errors[0, 2 * p.S - 1] = solutions.fun[1]
 
     for s in range(p.S - 2):  # Upper triangle
         ind2 = np.arange(s + 2)
-        b_guesses_to_use = np.diag(guesses_b[:p.S, :], p.S - (s + 2))
-        n_guesses_to_use = np.diag(guesses_n[:p.S, :], p.S - (s + 2))
-        theta_to_use = theta[j] * p.replacement_rate_adjust[:p.S]
-        bq_to_use = np.diag(bq[:p.S, :, j], p.S - (s + 2))
-        tr_to_use = np.diag(tr[:p.S, :, j], p.S - (s + 2))
-        tau_c_to_use = np.diag(p.tau_c[:p.S, :, j], p.S - (s + 2))
-        ubi_to_use = np.diag(ubi[:p.S, :, j], p.S - (s + 2))
+        b_guesses_to_use = np.diag(guesses_b[: p.S, :], p.S - (s + 2))
+        n_guesses_to_use = np.diag(guesses_n[: p.S, :], p.S - (s + 2))
+        # Pass the unadjusted replacement rate. pensions.SS_amount applies
+        # the replacement rate adjustment for each year of payment, so
+        # scaling theta here would apply the factor twice.
+        theta_to_use = theta[j]
+        bq_to_use = np.diag(bq[: p.S, :, j], p.S - (s + 2))
+        rm_to_use = np.diag(rm[: p.S, :, j], p.S - (s + 2))
+        tr_to_use = np.diag(tr[: p.S, :, j], p.S - (s + 2))
+        ubi_to_use = np.diag(ubi[: p.S, :, j], p.S - (s + 2))
 
-        length_diag =\
-            np.diag(p.etr_params[:p.S, :, 0], p.S-(s + 2)).shape[0]
-        etr_params_to_use = np.zeros((length_diag, p.etr_params.shape[2]))
-        mtrx_params_to_use = np.zeros((length_diag, p.mtrx_params.shape[2]))
-        mtry_params_to_use = np.zeros((length_diag, p.mtry_params.shape[2]))
-        for i in range(p.etr_params.shape[2]):
-            etr_params_to_use[:, i] =\
-                np.diag(p.etr_params[:p.S, :, i], p.S - (s + 2))
-            mtrx_params_to_use[:, i] =\
-                np.diag(p.mtrx_params[:p.S, :, i], p.S - (s + 2))
-            mtry_params_to_use[:, i] =\
-                np.diag(p.mtry_params[:p.S, :, i], p.S - (s + 2))
-        solutions = opt.root(
-            twist_doughnut, list(b_guesses_to_use) + list(n_guesses_to_use),
-            args=(r_p, w, bq_to_use, tr_to_use,
-                  theta_to_use, factor, ubi_to_use, j, s, 0,
-                  tau_c_to_use, etr_params_to_use,
-                  mtrx_params_to_use, mtry_params_to_use,
-                  initial_b, p),
-            method=p.FOC_root_method, tol=MINIMIZER_TOL)
+        num_params = len(p.etr_params[0][0])
+        # Convert the per-age tax-parameter slices to arrays here, once,
+        # rather than letting get_tax_rates re-convert them from nested
+        # lists on each of its many calls. mono/mono2D store callables,
+        # not numbers, so _params_to_array leaves them as nested lists.
+        temp_etr = [
+            [p.etr_params[t][p.S - s - 2 + t][i] for i in range(num_params)]
+            for t in range(s + 2)
+        ]
+        etr_params_to_use = _params_to_array(temp_etr, p.tax_func_type)
+        temp_mtrx = [
+            [p.mtrx_params[t][p.S - s - 2 + t][i] for i in range(num_params)]
+            for t in range(s + 2)
+        ]
+        mtrx_params_to_use = _params_to_array(temp_mtrx, p.tax_func_type)
+        temp_mtry = [
+            [p.mtry_params[t][p.S - s - 2 + t][i] for i in range(num_params)]
+            for t in range(s + 2)
+        ]
+        mtry_params_to_use = _params_to_array(temp_mtry, p.tax_func_type)
 
-        b_vec = solutions.x[:int(len(solutions.x) / 2)]
+        _tri_x0 = list(b_guesses_to_use) + list(n_guesses_to_use)
+        _tri_args = (
+            r_p,
+            w,
+            p_tilde,
+            p_i,
+            bq_to_use,
+            rm_to_use,
+            tr_to_use,
+            theta_to_use,
+            factor,
+            ubi_to_use,
+            j,
+            s,
+            0,
+            etr_params_to_use,
+            mtrx_params_to_use,
+            mtry_params_to_use,
+            b_splus1init,
+            p,
+            ndc_rates,
+        )
+        _tri_jac = _banded_jac_for(
+            twist_doughnut, _tri_x0, _tri_args, p.use_sparse_FOC_jac
+        )
+        try:
+            solutions = opt.root(
+                twist_doughnut,
+                _tri_x0,
+                args=_tri_args,
+                method=p.FOC_root_method,
+                tol=MINIMIZER_TOL,
+                jac=_tri_jac,
+            )
+        except Exception:
+            solutions = opt.root(
+                twist_doughnut,
+                _tri_x0,
+                args=_tri_args,
+                method=p.FOC_root_method,
+                tol=MINIMIZER_TOL,
+            )
+        solutions = _retry_root_if_failed(
+            solutions, twist_doughnut, _tri_x0, _tri_args, p
+        )
+
+        b_vec = solutions.x[: s + 2]
         b_mat[ind2, p.S - (s + 2) + ind2] = b_vec
-        n_vec = solutions.x[int(len(solutions.x) / 2):]
+        n_vec = solutions.x[s + 2 :]
         n_mat[ind2, p.S - (s + 2) + ind2] = n_vec
+        euler_errors[ind2, p.S - (s + 2) + ind2] = solutions.fun[: s + 2]
+        euler_errors[ind2, 2 * p.S - (s + 2) + ind2] = solutions.fun[s + 2 :]
 
     for t in range(0, p.T):
-        b_guesses_to_use = .75 * \
-            np.diag(guesses_b[t:t + p.S, :])
-        n_guesses_to_use = np.diag(guesses_n[t:t + p.S, :])
-        theta_to_use = theta[j] * p.replacement_rate_adjust[t:t + p.S]
-        bq_to_use = np.diag(bq[t:t + p.S, :, j])
-        tr_to_use = np.diag(tr[t:t + p.S, :, j])
-        tau_c_to_use = np.diag(p.tau_c[t:t + p.S, :, j])
-        ubi_to_use = np.diag(ubi[t:t + p.S, :, j])
+        b_guesses_to_use = 0.75 * np.diag(guesses_b[t : t + p.S, :])
+        n_guesses_to_use = np.diag(guesses_n[t : t + p.S, :])
+        theta_to_use = theta[j]
+        bq_to_use = np.diag(bq[t : t + p.S, :, j])
+        rm_to_use = np.diag(rm[t : t + p.S, :, j])
+        tr_to_use = np.diag(tr[t : t + p.S, :, j])
+        ubi_to_use = np.diag(ubi[t : t + p.S, :, j])
 
         # initialize array of diagonal elements
-        length_diag =\
-            np.diag(p.etr_params[t:t + p.S, :, 0]).shape[0]
-        etr_params_to_use = np.zeros((length_diag, p.etr_params.shape[2]))
-        mtrx_params_to_use = np.zeros((length_diag, p.mtrx_params.shape[2]))
-        mtry_params_to_use = np.zeros((length_diag, p.mtry_params.shape[2]))
+        num_params = len(p.etr_params[t][0])
+        etr_params_to_use = _params_to_array(
+            [
+                [p.etr_params[t + s][s][i] for i in range(num_params)]
+                for s in range(p.S)
+            ],
+            p.tax_func_type,
+        )
+        mtrx_params_to_use = _params_to_array(
+            [
+                [p.mtrx_params[t + s][s][i] for i in range(num_params)]
+                for s in range(p.S)
+            ],
+            p.tax_func_type,
+        )
+        mtry_params_to_use = _params_to_array(
+            [
+                [p.mtry_params[t + s][s][i] for i in range(num_params)]
+                for s in range(p.S)
+            ],
+            p.tax_func_type,
+        )
 
-        for i in range(p.etr_params.shape[2]):
-            etr_params_to_use[:, i] = np.diag(p.etr_params[t:t + p.S, :, i])
-            mtrx_params_to_use[:, i] = np.diag(p.mtrx_params[t:t + p.S, :, i])
-            mtry_params_to_use[:, i] = np.diag(p.mtry_params[t:t + p.S, :, i])
-
-        solutions = opt.root(
-            twist_doughnut, list(b_guesses_to_use) + list(n_guesses_to_use),
-            args=(r_p, w, bq_to_use, tr_to_use, theta_to_use,
-                  factor, ubi_to_use, j, None, t, tau_c_to_use,
-                  etr_params_to_use, mtrx_params_to_use,
-                  mtry_params_to_use, initial_b, p), method=p.FOC_root_method,
-            tol=MINIMIZER_TOL)
-        euler_errors[t, :] = solutions.fun
-
-        b_vec = solutions.x[:p.S]
+        _td_args = (
+            r_p,
+            w,
+            p_tilde,
+            p_i,
+            bq_to_use,
+            rm_to_use,
+            tr_to_use,
+            theta_to_use,
+            factor,
+            ubi_to_use,
+            j,
+            None,
+            t,
+            etr_params_to_use,
+            mtrx_params_to_use,
+            mtry_params_to_use,
+            b_splus1init,
+            p,
+            ndc_rates,
+        )
+        _td_x0 = list(b_guesses_to_use) + list(n_guesses_to_use)
+        # When p.use_sparse_FOC_jac is set, supply a banded finite-difference
+        # Jacobian (far fewer evaluations per build); otherwise _bj_jac is None
+        # and opt.root uses its default dense finite differences. The except
+        # clause is a safety net: any solver failure retries with the dense
+        # Jacobian, so the result is unchanged.
+        _bj_jac = _banded_jac_for(
+            twist_doughnut, _td_x0, _td_args, p.use_sparse_FOC_jac
+        )
+        try:
+            solutions = opt.root(
+                twist_doughnut,
+                _td_x0,
+                args=_td_args,
+                method=p.FOC_root_method,
+                tol=MINIMIZER_TOL,
+                jac=_bj_jac,
+            )
+        except Exception:
+            solutions = opt.root(
+                twist_doughnut,
+                _td_x0,
+                args=_td_args,
+                method=p.FOC_root_method,
+                tol=MINIMIZER_TOL,
+            )
+        solutions = _retry_root_if_failed(
+            solutions, twist_doughnut, _td_x0, _td_args, p
+        )
+        b_vec = solutions.x[: p.S]
         b_mat[t + ind, ind] = b_vec
-        n_vec = solutions.x[p.S:]
+        n_vec = solutions.x[p.S :]
         n_mat[t + ind, ind] = n_vec
-
-    # print('Type ', j, ' max euler error = ',
-    #       np.absolute(euler_errors).max())
+        euler_errors[t + ind, ind] = solutions.fun[: p.S]
+        euler_errors[t + ind, p.S + ind] = solutions.fun[p.S :]
 
     return euler_errors, b_mat, n_mat
 
 
+def _euler_error_message(eul_savings, eul_laborleisure):
+    """
+    Build the message for a household first order condition failure along
+    the transition path.
+
+    Reports the largest absolute savings and labor FOC residuals and the
+    (period, age, income group) at which each occurs. Residuals at ages
+    greater than the period index belong to households already alive when
+    the time path begins, whose partial-lifetime problems are the ones
+    most sensitive to the initial guesses.
+
+    Args:
+        eul_savings (Numpy array): savings FOC residuals, (T+S) x S x J
+        eul_laborleisure (Numpy array): labor FOC residuals, (T+S) x S x J
+
+    Returns:
+        msg (str): the diagnostic error message
+    """
+    msg = "Transition path equilibrium not found (eulers)."
+    for name, err in (
+        ("savings", eul_savings),
+        ("labor", eul_laborleisure),
+    ):
+        abs_err = np.absolute(err)
+        t, s, j = np.unravel_index(np.nanargmax(abs_err), abs_err.shape)
+        msg += (
+            f" Max {name} FOC error = {abs_err[t, s, j]:.2e} at period "
+            f"t={t}, age s={s}, income group j={j}"
+        )
+        if s > t:
+            msg += " (household alive at t=0)"
+        msg += "."
+    return msg
+
+
+def _rc_error_message(RC_error, RC_TPI):
+    """
+    Build the message for a transition resource-constraint failure.
+
+    Reports the maximum absolute resource-constraint error, the period it
+    occurs in, and how to read it: a violation confined to the first or last
+    periods is usually an initial- or terminal-boundary artifact, while one
+    spread across the path points to an inconsistent calibration.
+
+    Args:
+        RC_error (array_like): resource constraint error, time on axis 0
+        RC_TPI (scalar): the tolerance the error is checked against
+
+    Returns:
+        msg (str): the diagnostic error message
+    """
+    abs_rc = np.absolute(RC_error)
+    rc_by_period = abs_rc.reshape(abs_rc.shape[0], -1).max(axis=1)
+    t_worst = int(np.argmax(rc_by_period))
+    return (
+        "Transition path equilibrium not found (RC_error): max "
+        f"|resource constraint error| = {rc_by_period[t_worst]:.2e} at "
+        f"period {t_worst} of {rc_by_period.shape[0]} (tolerance "
+        f"RC_TPI = {RC_TPI}). A violation confined to the first or last "
+        "periods is usually an initial- or terminal-boundary artifact; one "
+        "spread across the path points to an inconsistent calibration "
+        "(spending, revenue, debt_ratio_ss)."
+    )
+
+
 def run_TPI(p, client=None):
-    '''
+    """
     Solve for transition path equilibrium of OG-Core.
 
     Args:
@@ -385,361 +955,1138 @@ def run_TPI(p, client=None):
         output (dictionary): dictionary with transition path solution
             results
 
-    '''
+    """
+    if p.use_sparse_FOC_jac and not _HAVE_SPARSE_FD:
+        print("[TPI] sparse FOC jacobian unavailable; using dense")
+    # Scope the Jacobian sparsity cache to this solve (see
+    # _detect_jac_sparsity); set before p is scattered so that every copy
+    # of p on the dask workers carries the same identifier
+    p._jac_cache_scope = uuid.uuid4().hex
     # unpack tuples of parameters
     initial_values, ss_vars, theta, baseline_values = get_initial_SS_values(p)
-    (B0, b_sinit, b_splus1init, factor, initial_b, initial_n) =\
-        initial_values
-    (TRbaseline, Gbaseline, Ig_baseline, D0_baseline,
-     Kg0_baseline) = baseline_values
+    B0, b_sinit, b_splus1init, factor, initial_n = initial_values
+    (
+        Ybaseline,
+        TRbaseline,
+        Gbaseline,
+        Ig_baseline,
+        FAbaseline,
+        D0_baseline,
+        Kg0_baseline,
+    ) = baseline_values
 
     # Create time path of UBI household benefits and aggregate UBI outlays
     ubi = p.ubi_nom_array / factor
-    UBI = aggr.get_L(ubi[:p.T], p, 'TPI')
+    UBI = aggr.get_L(ubi[: p.T], p, "TPI")
 
-    print('Government spending breakpoints are tG1: ', p.tG1,
-          '; and tG2:', p.tG2)
+    logger.info(
+        f"Government spending breakpoints are tG1: {p.tG1}; and tG2: {p.tG2}"
+    )
 
     # Initialize guesses at time paths
     # Make array of initial guesses for labor supply and savings
     guesses_b = utils.get_initial_path(
-        initial_b, ss_vars['bssmat_splus1'], p, 'ratio')
-    guesses_n = utils.get_initial_path(
-        initial_n, ss_vars['nssmat'], p, 'ratio')
+        b_splus1init, ss_vars["b_sp1"], p, "quadratic"
+    )
+    guesses_n = utils.get_initial_path(initial_n, ss_vars["n"], p, "quadratic")
     b_mat = guesses_b
     n_mat = guesses_n
     ind = np.arange(p.S)
 
     # Get path for aggregate savings and labor supply
-    L_init = np.ones((p.T + p.S,)) * ss_vars['Lss']
-    B_init = np.ones((p.T + p.S,)) * ss_vars['Bss']
-    L_init[:p.T] = aggr.get_L(n_mat[:p.T], p, 'TPI')
-    B_init[1:p.T] = aggr.get_B(b_mat[:p.T], p, 'TPI', False)[:p.T - 1]
-    B_init[0] = B0
-    K_init = B_init * ss_vars['Kss'] / ss_vars['Bss']
+    L_init = np.ones((p.T + p.S,)) * ss_vars["L"]
+    B_init = utils.get_initial_path(B0, ss_vars["B"], p, "quadratic")
+    L_init[: p.T] = aggr.get_L(n_mat[: p.T], p, "TPI")
+    # Get initial paths for aggregate capital by scaling the steady-state
+    # capital stocks with the path of B. These paths only serve as guesses
+    # for the first iteration: inside the loop K, K_d, K_f, and K_m are
+    # recomputed from household wealth and K_g from the fiscal rule.
+    # Starting a reform instead from the period-0 capital stocks of the
+    # baseline time path was found to send the outer loop off on a
+    # divergent track in the multi-industry example, so the same guesses
+    # are used for baseline and reform runs.
+    K_init = B_init * ss_vars["K"] / ss_vars["B"]
+    K_d = K_init * ss_vars["K_d"] / ss_vars["K"]
+    K_g = np.ones_like(K_init) * ss_vars["K_g"]
+    K_vec_init = (
+        np.ones((p.T + p.S, p.M))
+        * ss_vars["K_m"].reshape(1, p.M)
+        * np.tile((K_init / ss_vars["K"]).reshape(p.T + p.S, 1), (1, p.M))
+    )
     K = K_init
-    K_d = K_init * ss_vars['K_d_ss'] / ss_vars['Kss']
-    K_f = K_init * ss_vars['K_f_ss'] / ss_vars['Kss']
+    K_f = K_init - K_d
     L = L_init
     B = B_init
-    K_g = np.ones_like(K) * ss_vars['K_g_ss']
-    Y = np.zeros_like(K)
-    Y[:p.T] = firm.get_Y(K[:p.T], K_g[:p.T], L[:p.T], p, 'TPI')
-    Y[p.T:] = ss_vars['Yss']
-    I_g = np.ones_like(Y) * ss_vars['I_g_ss']
-    if p.baseline_spending:
-        I_g[:p.T] = Ig_baseline[:p.T]
-    else:
-        I_g = fiscal.get_I_g(Y, p.alpha_I)
-    if p.baseline:
-        K_g0 = p.initial_Kg_ratio * Y[0]
-    else:
-        K_g0 = Kg0_baseline
-    K_g = fiscal.get_K_g(K_g0, I_g, p, 'TPI')
+    # Get initial paths for industry specific labor
+    L_vec_init = np.ones((p.T + p.S, p.M)) * ss_vars["L_m"].reshape(1, p.M)
+    # Get the initial paths for industry specific output
+    Y_vec_init = np.ones((p.T + p.S, p.M)) * ss_vars["Y_m"].reshape(1, p.M)
+    for m in range(p.M):
+        Y_vec_init[: p.T, m] = firm.get_Y(
+            K_vec_init[: p.T, m], K_g[: p.T], L_vec_init[: p.T, m], p, "TPI", m
+        )
+    # compute w
+    w = np.ones_like(K) * ss_vars["w"]
+    # compute goods prices
+    p_m = np.ones((p.T + p.S, p.M)) * ss_vars["p_m"].reshape(1, p.M)
+    p_m[: p.T, :] = firm.get_pm(
+        w[: p.T], Y_vec_init[: p.T, :], L_vec_init[: p.T, :], p, "TPI"
+    )
+    p_m = p_m / p_m[:, -1].reshape(
+        p.T + p.S, 1
+    )  # normalize prices by industry M
+    Y = (
+        (Y_vec_init * p_m)
+        .sum(axis=1)
+        .reshape(
+            p.T + p.S,
+        )
+    )
+    p_i = (
+        np.tile(p.io_matrix.reshape(1, p.I, p.M), (p.T + p.S, 1, 1))
+        * np.tile(p_m.reshape(p.T + p.S, 1, p.M), (1, p.I, 1))
+    ).sum(axis=2)
+    p_tilde = aggr.get_ptilde(p_i[:, :], p.tau_c[:, :], p.alpha_c, "TPI")
+    if not any(p.zeta_K == 1):
+        w[: p.T] = np.squeeze(
+            firm.get_w(Y[: p.T], L[: p.T], p_m[: p.T, :], p, "TPI")
+        )
+    # repeat with updated w
+    p_m[: p.T, :] = firm.get_pm(
+        w[: p.T], Y_vec_init[: p.T, :], L_vec_init[: p.T, :], p, "TPI"
+    )
+    p_m = p_m / p_m[:, -1].reshape(
+        p.T + p.S, 1
+    )  # normalize prices by industry M
+    p_i = (
+        np.tile(p.io_matrix.reshape(1, p.I, p.M), (p.T + p.S, 1, 1))
+        * np.tile(p_m.reshape(p.T + p.S, 1, p.M), (1, p.I, 1))
+    ).sum(axis=2)
+    p_tilde = aggr.get_ptilde(p_i[:, :], p.tau_c[:, :], p.alpha_c, "TPI")
+    # path for interest rates
     r = np.zeros_like(Y)
-    r[:p.T] = firm.get_r(Y[:p.T], K[:p.T], p, 'TPI')
-    r[p.T:] = ss_vars['rss']
+    r[: p.T] = np.squeeze(
+        firm.get_r(Y[: p.T], K[: p.T], p_m[: p.T, :], p, "TPI")
+    )
+    r[p.T :] = ss_vars["r"]
     # For case where economy is small open econ
     r[p.zeta_K == 1] = p.world_int_rate[p.zeta_K == 1]
-    # Compute other interest rates
-    r_gov = fiscal.get_r_gov(r, p)
-    r_p = np.ones_like(r) * ss_vars['r_p_ss']
-    MPKg = firm.get_MPx(Y[:p.T], K_g[:p.T], p.gamma_g, p, 'TPI')
-    r_p[:p.T] = aggr.get_r_p(r[:p.T], r_gov[:p.T], K[:p.T], K_g[:p.T],
-                             ss_vars['Dss'], MPKg, p, 'TPI')
-
-    # compute w
-    w = np.ones_like(r) * ss_vars['wss']
-    if not any(p.zeta_K == 1):
-        w[:p.T] = firm.get_w(Y[:p.T], L[:p.T], p, 'TPI')
 
     # initial guesses at fiscal vars
     if p.budget_balance:
-        if np.abs(ss_vars['TR_ss']) < 1e-13:
+        if np.abs(ss_vars["TR"]) < 1e-13:
             TR_ss2 = 0.0  # sometimes SS is very small but not zero,
             # even if taxes are zero, this get's rid of the
             # approximation error, which affects the pct changes below
         else:
-            TR_ss2 = ss_vars['TR_ss']
+            TR_ss2 = ss_vars["TR"]
         TR = np.ones(p.T + p.S) * TR_ss2
-        total_tax_revenue = TR - ss_vars['agg_pension_outlays']
+        total_tax_revenue = TR - ss_vars["agg_pension_outlays"]
         G = np.zeros(p.T + p.S)
         D = np.zeros(p.T + p.S)
         D_d = np.zeros(p.T + p.S)
         D_f = np.zeros(p.T + p.S)
+        I_g = fiscal.get_I_g(Y[: p.T], Ig_baseline, p, "TPI")
     else:
         if p.baseline_spending:
-            TR = TRbaseline
-            G = Gbaseline
-            G[p.T:] = ss_vars['Gss']
+            # Will set to TRbaseline here, but will be updated in TPI loop
+            # with call to fiscal.get_TR
+            TR = np.concatenate(
+                (TRbaseline[: p.T], np.ones(p.S) * ss_vars["TR"])
+            )
+            # Infrastructure investment is the baseline path scaled by
+            # alpha_bs_I
+            I_g = np.concatenate(
+                (
+                    fiscal.get_I_g(Y[: p.T], Ig_baseline, p, "TPI"),
+                    np.ones(p.S) * ss_vars["I_g"],
+                )
+            )
+            # Will set to Gbaseline here, but will be updated in TPI loop
+            # with call to fiscal.D_G_path, which also does closure rule
+            G = np.concatenate((Gbaseline[: p.T], np.ones(p.S) * ss_vars["G"]))
         else:
             TR = p.alpha_T * Y
-            G = np.ones(p.T + p.S) * ss_vars['Gss']
-        D = np.ones(p.T + p.S) * ss_vars['Dss']
-        D_d = D * ss_vars['D_d_ss'] / ss_vars['Dss']
-        D_f = D * ss_vars['D_f_ss'] / ss_vars['Dss']
-    total_tax_revenue = np.ones(p.T + p.S) * ss_vars['total_tax_revenue']
+            G = np.ones(p.T + p.S) * ss_vars["G"]
+            I_g = np.ones(p.T + p.S) * ss_vars["I_g"]
+        D = np.ones(p.T + p.S) * ss_vars["D"]
+        D_d = D * ss_vars["D_d"] / ss_vars["D"]
+        D_f = D * ss_vars["D_f"] / ss_vars["D"]
+    # Foreign aid is alpha_FA * Y, or the baseline path scaled by
+    # alpha_bs_FA if baseline_spending=True
+    foreign_aid = fiscal.get_foreign_aid(Y[: p.T], FAbaseline, p, "TPI")
+    if p.baseline:
+        K_g0 = p.initial_Kg_ratio * Y[0]
+    else:
+        K_g0 = Kg0_baseline
+    K_g = fiscal.get_K_g(K_g0, I_g, p, "TPI")
+    total_tax_revenue = np.ones(p.T + p.S) * ss_vars["total_tax_revenue"]
+
+    # Compute other interest rates
+    r_gov = np.ones_like(r) * ss_vars["r_gov"]
+    r_gov[: p.T] = fiscal.get_r_gov(r[: p.T], D[: p.T] / Y[: p.T], p, "TPI")
+    r_p = np.ones_like(r) * ss_vars["r_p"]
+    MPKg = np.zeros((p.T, p.M))
+    for m in range(p.M):
+        MPKg[:, m] = np.squeeze(
+            firm.get_MPx(
+                Y_vec_init[: p.T, m], K_g[: p.T], p.gamma_g[m], p, "TPI", m
+            )
+        )
+    r_p[: p.T] = aggr.get_r_p(
+        r[: p.T],
+        r_gov[: p.T],
+        p_m[: p.T, :],
+        K_vec_init[: p.T, :],
+        K_g[: p.T],
+        D[: p.T],
+        MPKg,
+        p,
+        "TPI",
+    )
 
     # Initialize bequests
-    BQ0 = aggr.get_BQ(r_p[0], initial_b, None, p, 'SS', True)
+    BQ0 = aggr.get_BQ(r_p[0], b_splus1init, None, p, "SS", True)
     if not p.use_zeta:
         BQ = np.zeros((p.T + p.S, p.J))
         for j in range(p.J):
-            BQ[:, j] = (list(np.linspace(BQ0[j],
-                                         ss_vars['BQss'][j], p.T)) +
-                        [ss_vars['BQss'][j]] * p.S)
+            BQ[:, j] = (
+                list(np.linspace(BQ0[j], ss_vars["BQ"][j], p.T))
+                + [ss_vars["BQ"][j]] * p.S
+            )
         BQ = np.array(BQ)
     else:
-        BQ = (list(np.linspace(BQ0, ss_vars['BQss'], p.T)) +
-              [ss_vars['BQss']] * p.S)
+        BQ = list(np.linspace(BQ0, ss_vars["BQ"], p.T)) + [ss_vars["BQ"]] * p.S
         BQ = np.array(BQ)
 
+    # Initialize aggregate remittances
+    if p.baseline:
+        RM = aggr.get_RM(Y, p, "TPI")
+    else:
+        # This is the reform case and is based off of Ybaseline, but allows for
+        # remittance parameters to change in a reform and update the RM series
+        Ybaseline_ext = np.concatenate(
+            [Ybaseline, np.ones(p.S) * Ybaseline[-1]]
+        )
+        RM = aggr.get_RM(Ybaseline_ext, p, "TPI")
+
+    # Start transition path iteration (TPI)
     TPIiter = 0
     TPIdist = 10
-    euler_errors = np.zeros((p.T, 2 * p.S, p.J))
+    euler_errors = np.zeros((p.T + p.S, 2 * p.S, p.J))
     TPIdist_vec = np.zeros(p.maxiter)
+    stall = None
+    stall_reported = None
+    # Pluggable outer-loop update rule. Default "picard" -> None -> the native
+    # damped functional-iteration path below (unchanged, so golden outputs
+    # are preserved); "anderson" accelerates using the residual history. See
+    # ogcore.solvers.
+    outer_updater = solvers.make_outer_updater(
+        getattr(p, "TPI_outer_method", "picard"), p
+    )
+    # Optional trust region for the accelerated step ("anchored" Anderson):
+    # clamp each step to within trust_radius x the damped-step length of the
+    # always-feasible damped point, growing the radius after an improving step
+    # and shrinking it (with a reset) after a worsening one. This keeps the
+    # accelerated iterate near a feasible point -- the standard cure for the
+    # overshoot-into-infeasible-region divergence of unguarded accelerators.
+    # Defaults to 1.0 (anchored) when accelerating; a non-positive radius
+    # disables the trust region (unguarded accelerator, for testing only).
+    trust_radius = getattr(p, "TPI_trust_radius", 1.0)
+    if trust_radius is not None and trust_radius <= 0:
+        trust_radius = None
+    trust_radius_min = getattr(p, "TPI_trust_radius_min", 0.1)
+    trust_radius_max = getattr(p, "TPI_trust_radius_max", 10.0)
+    prev_accel_dist = np.inf
+
+    if client:
+        # Before scattering, temporarily remove unpicklable schema objects
+        schema_backup = {}
+        for attr in ["_defaults_schema", "_validator_schema", "sel"]:
+            if hasattr(p, attr):
+                schema_backup[attr] = getattr(p, attr)
+                try:
+                    delattr(p, attr)
+                except Exception:
+                    pass
+
+        # Scatter the parameters
+        scattered_p_future = client.scatter(p, broadcast=True)
+
+        # Restore the schema objects (they're not needed by workers anyway)
+        for attr, value in schema_backup.items():
+            try:
+                setattr(p, attr, value)
+            except Exception:
+                pass
 
     # TPI loop
     while (TPIiter < p.maxiter) and (TPIdist >= p.mindist_TPI):
-        r_gov[:p.T] = fiscal.get_r_gov(r[:p.T], p)
-        K[:p.T] = firm.get_K_from_Y(Y[:p.T], r[:p.T], p, 'TPI')
-        MPKg = firm.get_MPx(Y[:p.T], K_g[:p.T], p.gamma_g, p, 'TPI')
-        r_p[:p.T] = aggr.get_r_p(r[:p.T], r_gov[:p.T], K[:p.T], K_g[:p.T],
-                                 D[:p.T], MPKg[:p.T], p, 'TPI')
-
-        outer_loop_vars = (r, w, r_p, BQ, TR, theta)
-
-        euler_errors = np.zeros((p.T, 2 * p.S, p.J))
-        lazy_values = []
-        if client:
-            scattered_p = client.scatter(p, broadcast=True)
+        # NDC credited and discount rates by period, from this
+        # iteration's interest rate, GDP, wage, and labor paths
+        # the hybrid DB-NDC system credits its NDC accounts the same way
+        if p.pension_system in (
+            "Notional Defined Contribution",
+            "Hybrid DB-NDC",
+        ):
+            ndc_rates = pensions.ndc_rates_path(r_p, Y, w, L, p, "TPI")
         else:
-            scattered_p = p
-        for j in range(p.J):
-            guesses = (guesses_b[:, :, j], guesses_n[:, :, j])
-            lazy_values.append(
-                delayed(inner_loop)(
-                    guesses, outer_loop_vars, initial_values, ubi, j,
-                    ind, scattered_p))
-        if client:
-            futures = client.compute(lazy_values,
-                                     num_workers=p.num_workers)
-            results = client.gather(futures)
-        else:
-            results = results = compute(
-                *lazy_values, scheduler=dask.multiprocessing.get,
-                num_workers=p.num_workers)
+            ndc_rates = None
+        outer_loop_vars = (r_p, r, w, p_m, BQ, RM, TR, theta, ndc_rates)
+        # compute composite good price
+        p_i = (
+            np.tile(p.io_matrix.reshape(1, p.I, p.M), (p.T + p.S, 1, 1))
+            * np.tile(p_m.reshape(p.T + p.S, 1, p.M), (1, p.I, 1))
+        ).sum(axis=2)
+        p_tilde = aggr.get_ptilde(p_i[:, :], p.tau_c[:, :], p.alpha_c, "TPI")
 
+        # Initialize Euler errors
+        euler_errors = np.zeros((p.T + p.S, 2 * p.S, p.J))
+        # Solve for household decisions
+        results = []
+        if client:
+            futures = []
+            for j in range(p.J):
+                guesses = (guesses_b[:, :, j], guesses_n[:, :, j])
+                f = client.submit(
+                    inner_loop,
+                    guesses,
+                    outer_loop_vars,
+                    initial_values,
+                    ubi,
+                    j,
+                    ind,
+                    scattered_p_future,
+                )
+                futures.append(f)
+            try:
+                # Wait for futures with timeout, then gather results
+                done, not_done = wait(futures, timeout=600)
+                if not_done:
+                    # Some futures didn't complete in time
+                    raise TimeoutError(
+                        f"{len(not_done)} futures did not complete"
+                        " within 600 seconds"
+                    )
+                results = client.gather(futures)
+            except Exception as e:
+                # Cancel remaining futures and fall back to serial computation
+                logger.warning(
+                    f"Dask computation failed with error: {e}. "
+                    "Falling back to serial computation for this iteration."
+                )
+                for future in futures:
+                    future.cancel()
+                results = []
+                for j in range(p.J):
+                    guesses = (guesses_b[:, :, j], guesses_n[:, :, j])
+                    res = inner_loop(
+                        guesses,
+                        outer_loop_vars,
+                        initial_values,
+                        ubi,
+                        j,
+                        ind,
+                        p,
+                    )
+                    results.append(res)
+        else:
+            # Serial fallback (no dask client)
+            for j in range(p.J):
+                guesses = (guesses_b[:, :, j], guesses_n[:, :, j])
+                res = inner_loop(
+                    guesses,
+                    outer_loop_vars,
+                    initial_values,
+                    ubi,
+                    j,
+                    ind,
+                    p,  # pass the raw object directly
+                )
+                results.append(res)
         for j, result in enumerate(results):
             euler_errors[:, :, j], b_mat[:, :, j], n_mat[:, :, j] = result
 
         bmat_s = np.zeros((p.T, p.S, p.J))
-        bmat_s[0, 1:, :] = initial_b[:-1, :]
-        bmat_s[1:, 1:, :] = b_mat[:p.T-1, :-1, :]
+        bmat_s[0, 1:, :] = b_splus1init[:-1, :]
+        bmat_s[1:, 1:, :] = b_mat[: p.T - 1, :-1, :]
         bmat_splus1 = np.zeros((p.T, p.S, p.J))
-        bmat_splus1[:, :, :] = b_mat[:p.T, :, :]
+        bmat_splus1[:, :, :] = b_mat[: p.T, :, :]
 
-        etr_params_4D = np.tile(
-            p.etr_params[:p.T, :, :].reshape(p.T, p.S, 1, p.etr_params.shape[2]),
-            (1, 1, p.J, 1))
-        bqmat = household.get_bq(BQ, None, p, 'TPI')
-        trmat = household.get_tr(TR, None, p, 'TPI')
+        num_params = len(p.etr_params[0][0])
+        etr_params_4D = [
+            [
+                [
+                    [p.etr_params[t][s][i] for i in range(num_params)]
+                    for j in range(p.J)
+                ]
+                for s in range(p.S)
+            ]
+            for t in range(p.T)
+        ]
+
+        bqmat = household.get_bq(BQ, None, p, "TPI")
+        rmmat = household.get_rm(RM, None, p, "TPI")
+        trmat = household.get_tr(TR, None, p, "TPI")
         tax_mat = tax.net_taxes(
-            r_p[:p.T], w[:p.T], bmat_s, n_mat[:p.T, :, :],
-            bqmat[:p.T, :, :], factor, trmat[:p.T, :, :], ubi[:p.T, :, :],
-            theta, 0, None, False, 'TPI', p.e, etr_params_4D, p)
+            r_p[: p.T],
+            w[: p.T],
+            bmat_s,
+            n_mat[: p.T, :, :],
+            bqmat[: p.T, :, :],
+            factor,
+            trmat[: p.T, :, :],
+            ubi[: p.T, :, :],
+            theta,
+            0,
+            None,
+            False,
+            "TPI",
+            p.e,
+            etr_params_4D,
+            p,
+            ndc_rates,
+        )
+        income_tax_mat = tax.income_tax_liab(
+            r_p[: p.T],
+            w[: p.T],
+            bmat_s,
+            n_mat[: p.T, :, :],
+            factor,
+            0,
+            None,
+            "TPI",
+            p.e,
+            etr_params_4D,
+            p,
+        )
+        pension_mat = pensions.pension_amount(
+            r_p[: p.T],
+            w[: p.T],
+            n_mat[: p.T, :, :],
+            ndc_rates,
+            theta,
+            0,
+            None,
+            False,
+            "TPI",
+            p.e,
+            factor,
+            p,
+        )
+        bq_tax_mat = tax.bequest_tax_liab(
+            r_p[: p.T], bmat_s, bqmat[: p.T, :, :], 0, None, "TPI", p
+        )
+        wealth_tax_mat = tax.wealth_tax_liab(
+            r_p[: p.T], bmat_s, 0, None, "TPI", p
+        )
         r_p_path = utils.to_timepath_shape(r_p)
-        wpath = utils.to_timepath_shape(w)
-        c_mat = household.get_cons(r_p_path[:p.T, :, :], wpath[:p.T, :, :],
-                                   bmat_s, bmat_splus1,
-                                   n_mat[:p.T, :, :], bqmat[:p.T, :, :],
-                                   tax_mat, p.e, p.tau_c[:p.T, :, :], p)
-        y_before_tax_mat = household.get_y(
-            r_p_path[:p.T, :, :], wpath[:p.T, :, :],
-            bmat_s[:p.T, :, :], n_mat[:p.T, :, :], p)
+        p_tilde_path = utils.to_timepath_shape(p_tilde)
 
-        (total_tax_rev, iit_payroll_tax_revenue,
-         agg_pension_outlays, UBI_outlays, bequest_tax_revenue,
-         wealth_tax_revenue, cons_tax_revenue, business_tax_revenue,
-         payroll_tax_revenue, iit_revenue) = aggr.revenue(
-                r_p[:p.T], w[:p.T], bmat_s, n_mat[:p.T, :, :],
-                bqmat[:p.T, :, :], c_mat[:p.T, :, :], Y[:p.T], L[:p.T],
-                K[:p.T], factor, ubi[:p.T, :, :], theta, etr_params_4D, p,
-                'TPI')
-        total_tax_revenue[:p.T] = total_tax_rev
-        dg_fixed_values = (Y, total_tax_revenue, agg_pension_outlays,
-                           UBI_outlays, TR, I_g, Gbaseline, D0_baseline)
-        (Dnew, G[:p.T], D_d[:p.T], D_f[:p.T], new_borrowing,
-         debt_service, new_borrowing_f) =\
-            fiscal.D_G_path(r_gov, dg_fixed_values, p)
-        L[:p.T] = aggr.get_L(n_mat[:p.T], p, 'TPI')
-        B[1:p.T] = aggr.get_B(bmat_splus1[:p.T], p, 'TPI',
-                              False)[:p.T - 1]
-        w_open = firm.get_w_from_r(p.world_int_rate[:p.T], p, 'TPI')
-        K_demand_open = firm.get_K(
-            p.world_int_rate[:p.T], w_open, L[:p.T], p, 'TPI')
-        K[:p.T], K_d[:p.T], K_f[:p.T] = aggr.get_K_splits(
-            B[:p.T], K_demand_open, D_d[:p.T], p.zeta_K[:p.T])
-        Ynew = firm.get_Y(K[:p.T], K_g[:p.T], L[:p.T], p, 'TPI')
-        if not p.baseline_spending:
-            I_g = fiscal.get_I_g(Ynew, p.alpha_I)
+        wpath = utils.to_timepath_shape(w)
+        c_mat = household.get_cons(
+            r_p_path[: p.T, :, :],
+            wpath[: p.T, :, :],
+            p_tilde_path[: p.T, :, :],
+            p_i[: p.T, :],
+            bmat_s,
+            bmat_splus1,
+            n_mat[: p.T, :, :],
+            bqmat[: p.T, :, :],
+            rmmat[: p.T, :, :],
+            tax_mat,
+            p.e,
+            p.tau_c[: p.T, :],
+            p,
+            method="TPI",
+        )
+        c_i = household.get_ci(
+            c_mat[: p.T, :, :],
+            p_i[: p.T, :],
+            p_tilde[: p.T],
+            p.tau_c[: p.T, :],
+            p.alpha_c,
+            p.c_min,
+            "TPI",
+        )
+        sales_tax_mat = tax.cons_tax_liab(c_i, p_i, p, "TPI")
+        C = aggr.get_C(c_mat, p, "TPI")
+
+        c_i = household.get_ci(
+            c_mat[: p.T, :, :],
+            p_i[: p.T, :],
+            p_tilde[: p.T],
+            p.tau_c[: p.T, :],
+            p.alpha_c,
+            p.c_min,
+            "TPI",
+        )
+        y_before_tax_mat = household.get_y(
+            r_p_path[: p.T, :, :],
+            wpath[: p.T, :, :],
+            bmat_s[: p.T, :, :],
+            n_mat[: p.T, :, :],
+            p,
+            "TPI",
+        )
+        labor_income_mat = (
+            w[: p.T].reshape(p.T, 1, 1) * n_mat[: p.T, :, :] * p.e
+        )
+        capital_income_mat = (
+            r_p[: p.T].reshape(p.T, 1, 1) * bmat_s[: p.T, :, :]
+        )
+        # Update aggregate variables
+        L[: p.T] = aggr.get_L(n_mat[: p.T], p, "TPI")
+        B[1 : p.T] = aggr.get_B(bmat_splus1[: p.T], p, "TPI", False)[: p.T - 1]
+        w_open = firm.get_w_from_r(p.world_int_rate[: p.T], p, "TPI")
+
+        # Find output, labor demand, capital demand for M-1 industries
+        L_vec = np.zeros((p.T, p.M))
+        K_vec = np.zeros((p.T, p.M))
+        C_vec = np.zeros((p.T, p.I))
+        K_demand_open_vec = np.zeros((p.T, p.M))
+        for i_ind in range(p.I):
+            C_vec[:, i_ind] = aggr.get_C(c_i[: p.T, i_ind, :, :], p, "TPI")
+        Y_vec = (
+            np.tile(p.io_matrix.reshape(1, p.I, p.M), (p.T, 1, 1))
+            * np.tile(C_vec[: p.T, :].reshape(p.T, p.I, 1), (1, 1, p.M))
+        ).sum(axis=1)
+        for m_ind in range(p.M - 1):
+            KYrat_m = firm.get_KY_ratio(
+                r[: p.T], p_m[: p.T, :], p, "TPI", m_ind
+            )
+            K_vec[:, m_ind] = KYrat_m * Y_vec[:, m_ind]
+            L_vec[:, m_ind] = firm.solve_L(
+                Y_vec[:, m_ind], K_vec[:, m_ind], K_g, p, "TPI", m_ind
+            )
+            K_demand_open_vec[:, m_ind] = firm.get_K(
+                p.world_int_rate[: p.T],
+                w_open[: p.T],
+                L_vec[: p.T, m_ind],
+                p,
+                "TPI",
+                m_ind,
+            )
+
+        # Find output, labor demand, capital demand for last industry
+        L_M = np.maximum(
+            np.ones(p.T) * 0.001, L[: p.T] - L_vec[: p.T, :].sum(-1)
+        )  # make sure L_M > 0
+        K_demand_open_vec[:, -1] = firm.get_K(
+            p.world_int_rate[: p.T], w_open[: p.T], L_M[: p.T], p, "TPI", -1
+        )
+        K[: p.T], K_d[: p.T], K_f[: p.T] = aggr.get_K_splits(
+            B[: p.T],
+            K_demand_open_vec[: p.T, :].sum(-1),
+            D_d[: p.T],
+            p.zeta_K[: p.T],
+        )
+        K_M = np.maximum(
+            np.ones(p.T) * 0.001, K[: p.T] - K_vec[: p.T, :].sum(-1)
+        )  # make sure K_M > 0
+
+        L_vec[:, -1] = L_M
+        K_vec[:, -1] = K_M
+        Y_vec[:, -1] = firm.get_Y(
+            K_vec[: p.T, -1], K_g[: p.T], L_vec[: p.T, -1], p, "TPI", -1
+        )
+
+        Y = (p_m[: p.T, :] * Y_vec[: p.T, :]).sum(-1)
+
+        (
+            total_tax_rev,
+            iit_payroll_tax_revenue,
+            agg_pension_outlays,
+            UBI_outlays,
+            bequest_tax_revenue,
+            wealth_tax_revenue,
+            cons_tax_revenue,
+            business_tax_revenue,
+            payroll_tax_revenue,
+            iit_revenue,
+        ) = aggr.revenue(
+            r_p[: p.T],
+            w[: p.T],
+            bmat_s,
+            n_mat[: p.T, :, :],
+            bqmat[: p.T, :, :],
+            c_i[: p.T, :, :, :],
+            Y_vec[: p.T, :],
+            L_vec[: p.T, :],
+            K_vec[: p.T, :],
+            p_m[: p.T, :],
+            factor,
+            ubi[: p.T, :, :],
+            theta,
+            etr_params_4D,
+            p.e,
+            p,
+            None,
+            "TPI",
+            ndc_rates,
+        )
+        total_tax_revenue[: p.T] = total_tax_rev
+        I_g = fiscal.get_I_g(Y[: p.T], Ig_baseline, p, "TPI")
+        foreign_aid = fiscal.get_foreign_aid(Y[: p.T], FAbaseline, p, "TPI")
         if p.baseline:
-            K_g0 = p.initial_Kg_ratio * Ynew[0]
-        K_g = fiscal.get_K_g(K_g0, I_g, p, 'TPI')
-        Ynew = firm.get_Y(K[:p.T], K_g[:p.T], L[:p.T], p, 'TPI')
+            K_g0 = p.initial_Kg_ratio * Y[0]
+        K_g = fiscal.get_K_g(K_g0, I_g, p, "TPI")
+        dg_fixed_values = (
+            Y,
+            total_tax_revenue,
+            agg_pension_outlays,
+            UBI_outlays,
+            TR,
+            I_g,
+            foreign_aid,
+            Gbaseline,
+            D0_baseline,
+        )
+        (
+            Dnew,
+            G[: p.T],
+            D_d[: p.T],
+            D_f[: p.T],
+            r_gov_new,
+            new_borrowing,
+            debt_service,
+            new_borrowing_f,
+        ) = fiscal.D_G_path(r, dg_fixed_values, p)
+
         rnew = r.copy()
-        rnew[:p.T] = firm.get_r(Ynew[:p.T], K[:p.T], p, 'TPI')
+        rnew[: p.T] = np.squeeze(
+            firm.get_r(
+                Y_vec[: p.T, -1], K_vec[: p.T, -1], p_m[: p.T, :], p, "TPI", -1
+            )
+        )
         # For case where economy is small open econ
         rnew[p.zeta_K == 1] = p.world_int_rate[p.zeta_K == 1]
-        r_gov_new = fiscal.get_r_gov(rnew, p)
-        MPKg = firm.get_MPx(Ynew[:p.T], K_g[:p.T], p.gamma_g, p, 'TPI')
-        r_p_new = aggr.get_r_p(rnew[:p.T], r_gov_new[:p.T], K[:p.T], K_g[:p.T],
-                               Dnew[:p.T], MPKg[:p.T], p, 'TPI')
-        # compute w
-        wnew = firm.get_w(Ynew[:p.T], L[:p.T], p, 'TPI')
+        MPKg_vec = np.zeros((p.T, p.M))
+        for m in range(p.M):
+            MPKg_vec[:, m] = np.squeeze(
+                firm.get_MPx(
+                    Y_vec[: p.T, m], K_g[: p.T], p.gamma_g[m], p, "TPI", m
+                )
+            )
 
-        b_mat_shift = np.append(np.reshape(initial_b, (1, p.S, p.J)),
-                                b_mat[:p.T - 1, :, :], axis=0)
-        BQnew = aggr.get_BQ(r_p_new[:p.T], b_mat_shift, None, p,
-                            'TPI', False)
-        bqmat_new = household.get_bq(BQnew, None, p, 'TPI')
-        (total_tax_rev, iit_payroll_tax_revenue,
-         agg_pension_outlays, UBI_outlays, bequest_tax_revenue,
-         wealth_tax_revenue, cons_tax_revenue, business_tax_revenue,
-         payroll_tax_revenue, iit_revenue) = aggr.revenue(
-                r_p_new[:p.T], wnew[:p.T], bmat_s, n_mat[:p.T, :, :],
-                bqmat_new[:p.T, :, :], c_mat[:p.T, :, :], Ynew[:p.T],
-                L[:p.T], K[:p.T], factor, ubi[:p.T, :, :], theta,
-                etr_params_4D, p, 'TPI')
-        total_tax_revenue[:p.T] = total_tax_rev
+        K[: p.T], K_d[: p.T], K_f[: p.T] = aggr.get_K_splits(
+            B[: p.T], K_demand_open_vec.sum(-1), D_d[: p.T], p.zeta_K[: p.T]
+        )
+        r_gov_new = fiscal.get_r_gov(
+            rnew[: p.T], Dnew[: p.T] / Y[: p.T], p, "TPI"
+        )
+        r_p_new = aggr.get_r_p(
+            rnew[: p.T],
+            r_gov_new[: p.T],
+            p_m[: p.T, :],
+            K_vec[: p.T, :],
+            K_g[: p.T],
+            Dnew[: p.T],
+            MPKg_vec,
+            p,
+            "TPI",
+        )
+
+        # compute w
+        wnew = np.squeeze(
+            firm.get_w(
+                Y_vec[: p.T, -1], L_vec[: p.T, -1], p_m[: p.T, :], p, "TPI", -1
+            )
+        )
+
+        # compute new prices
+        new_p_m = firm.get_pm(wnew, Y_vec, L_vec, p, "TPI")
+        new_p_m = new_p_m / new_p_m[:, -1].reshape(
+            p.T, 1
+        )  # normalize prices by industry M
+
+        b_mat_shift = np.append(
+            np.reshape(b_splus1init, (1, p.S, p.J)),
+            b_mat[: p.T - 1, :, :],
+            axis=0,
+        )
+        BQnew = aggr.get_BQ(r_p_new[: p.T], b_mat_shift, None, p, "TPI", False)
+        bqmat_new = household.get_bq(BQnew, None, p, "TPI")
+        (
+            total_tax_rev,
+            iit_payroll_tax_revenue,
+            agg_pension_outlays,
+            UBI_outlays,
+            bequest_tax_revenue,
+            wealth_tax_revenue,
+            cons_tax_revenue,
+            business_tax_revenue,
+            payroll_tax_revenue,
+            iit_revenue,
+        ) = aggr.revenue(
+            r_p_new[: p.T],
+            wnew[: p.T],
+            bmat_s,
+            n_mat[: p.T, :, :],
+            bqmat_new[: p.T, :, :],
+            c_i[: p.T, :, :, :],
+            Y_vec[: p.T, :],
+            L_vec[: p.T, :],
+            K_vec[: p.T, :],
+            new_p_m[: p.T, :],
+            factor,
+            ubi[: p.T, :, :],
+            theta,
+            etr_params_4D,
+            p.e,
+            p,
+            None,
+            "TPI",
+            ndc_rates,
+        )
+        total_tax_revenue[: p.T] = total_tax_rev
         TR_new = fiscal.get_TR(
-            Ynew[:p.T], TR[:p.T], G[:p.T], total_tax_revenue[:p.T],
-            agg_pension_outlays[:p.T], UBI_outlays[:p.T], I_g[:p.T],
-            p, 'TPI')
+            Y[: p.T],
+            TR[: p.T],
+            G[: p.T],
+            total_tax_revenue[: p.T],
+            agg_pension_outlays[: p.T],
+            UBI_outlays[: p.T],
+            I_g[: p.T],
+            foreign_aid[: p.T],
+            p,
+            "TPI",
+        )
+        RM = aggr.get_RM(Y[: p.T], p, "TPI")
+        RM = np.concatenate([RM, np.ones(p.S) * RM[-1]])
 
         # update vars for next iteration
-        w[:p.T] = utils.convex_combo(wnew[:p.T], w[:p.T], p.nu)
-        r[:p.T] = utils.convex_combo(rnew[:p.T], r[:p.T], p.nu)
-        BQ[:p.T] = utils.convex_combo(BQnew[:p.T], BQ[:p.T], p.nu)
-        D[:p.T] = Dnew[:p.T]
-        Y[:p.T] = utils.convex_combo(Ynew[:p.T], Y[:p.T], p.nu)
-        if not p.baseline_spending:
-            TR[:p.T] = utils.convex_combo(TR_new[:p.T], TR[:p.T], p.nu)
+        if outer_updater is None:
+            # "picard": the historical damped functional-iteration step,
+            # unchanged, so the default behavior (and golden outputs) is
+            # preserved exactly.
+            w[: p.T] = utils.convex_combo(wnew[: p.T], w[: p.T], p.nu)
+            r[: p.T] = utils.convex_combo(rnew[: p.T], r[: p.T], p.nu)
+            r_p[: p.T] = utils.convex_combo(r_p_new[: p.T], r_p[: p.T], p.nu)
+            p_m[: p.T, :] = utils.convex_combo(
+                new_p_m[: p.T, :], p_m[: p.T, :], p.nu
+            )
+            BQ[: p.T] = utils.convex_combo(BQnew[: p.T], BQ[: p.T], p.nu)
+            if not p.baseline_spending:
+                TR[: p.T] = utils.convex_combo(TR_new[: p.T], TR[: p.T], p.nu)
+        else:
+            # Accelerated outer step on the packed macro/price vector
+            # {r_p, r, w, p_m, BQ[, TR]}; the update rule (Anderson) uses the
+            # recent residual history. Auxiliaries stay damped below.
+            blocks = [
+                (r_p, r_p_new),
+                (r, rnew),
+                (w, wnew),
+                (p_m, new_p_m),
+                (BQ, BQnew),
+            ]
+            if not p.baseline_spending:
+                blocks.append((TR, TR_new))
+            x, gx = solvers.pack_outer_vars(blocks, p.T)
+            # True fixed-point residual (implied vs the PRE-update guess). The
+            # post-update TPIdist below is spuriously ~0 for steps that set
+            # x_next ~= gx (e.g. Anderson's undamped first step), so it is
+            # overridden with this to avoid declaring false convergence.
+            accel_dist = float(np.max(utils.pct_diff_func(gx, x)))
+            # Anchored/trust-region control: grow the radius after an improving
+            # accelerated step and shrink it (resetting the memory) after a
+            # worsening one, using the residual trend as the accept/reject
+            # signal. None => unclamped.
+            if trust_radius is not None and TPIiter > 0:
+                if accel_dist <= prev_accel_dist:
+                    trust_radius = min(trust_radius_max, trust_radius * 1.5)
+                else:
+                    trust_radius = max(trust_radius_min, trust_radius * 0.5)
+                    outer_updater.reset()
+                    logger.info(
+                        f"accel step worsened; trust radius -> {trust_radius}"
+                    )
+            prev_accel_dist = accel_dist
+            # Accelerate the DAMPED map (1-nu)x + nu*G(x), which is contractive
+            # at the calibrated nu, rather than the raw map G -- G is
+            # non-contractive on the stiff case (why Picard needs a low nu), so
+            # accelerating it directly overshoots and diverges. Same fixed
+            # point; convergence is still measured on the raw residual above.
+            gx_damped = (1.0 - p.nu) * x + p.nu * gx
+            x_next = outer_updater.update(x, gx_damped)
+            if not np.all(np.isfinite(x_next)):
+                # accelerated step blew up -> damped Picard fallback + reset
+                x_next = p.nu * gx + (1.0 - p.nu) * x
+                outer_updater.reset()
+                logger.info(
+                    "accelerated step non-finite; Picard fallback + reset"
+                )
+            elif trust_radius is not None:
+                # Clamp the accelerated step to the trust region around the
+                # always-feasible damped point gx_damped, sized relative to the
+                # damped step length so it tightens as the solve converges.
+                dev = x_next - gx_damped
+                dev_norm = float(np.linalg.norm(dev))
+                max_dev = trust_radius * float(np.linalg.norm(gx_damped - x))
+                if dev_norm > max_dev > 0.0:
+                    x_next = gx_damped + dev * (max_dev / dev_norm)
+            solvers.unpack_outer_vars(x_next, blocks, p.T)
+        # Auxiliaries (unchanged): government rate, debt, and the household
+        # policy warm-starts stay on the damped update.
+        r_gov[: p.T] = utils.convex_combo(r_gov_new[: p.T], r_gov[: p.T], p.nu)
+        D[: p.T] = Dnew[: p.T]
+        if p.baseline and p.initial_wealth_ratio is not None:
+            # Initial aggregate household wealth is a target ratio to
+            # initial GDP, which is endogenous: move B[0] toward the
+            # target with the outer-loop damping and scale the initial
+            # distribution of savings (whose shape is fixed) to match, so
+            # that the next inner loop starts households from it
+            B0 = utils.convex_combo(p.initial_wealth_ratio * Y[0], B[0], p.nu)
+            B[0] = B0
+            b_splus1init = b_splus1init * (
+                B0 / aggr.get_B(b_splus1init, p, "SS", True)
+            )
+            b_sinit = np.zeros((p.S, p.J))
+            b_sinit[1:, :] = b_splus1init[:-1, :]
+            initial_values = (B0, b_sinit, b_splus1init, factor, initial_n)
         guesses_b = utils.convex_combo(b_mat, guesses_b, p.nu)
         guesses_n = utils.convex_combo(n_mat, guesses_n, p.nu)
-        print('w diff: ', (wnew[:p.T] - w[:p.T]).max(),
-              (wnew[:p.T] - w[:p.T]).min())
-        print('r diff: ', (rnew[:p.T] - r[:p.T]).max(),
-              (rnew[:p.T] - r[:p.T]).min())
-        print('BQ diff: ', (BQnew[:p.T] - BQ[:p.T]).max(),
-              (BQnew[:p.T] - BQ[:p.T]).min())
-        print('TR diff: ', (TR_new[:p.T]-TR[:p.T]).max(),
-              (TR_new[:p.T] - TR[:p.T]).min())
-        print('Y diff: ', (Ynew[:p.T]-Y[:p.T]).max(),
-              (Ynew[:p.T] - Y[:p.T]).min())
+        logger.info(
+            f"w diff: {(wnew[: p.T] - w[: p.T]).max()}, "
+            + f"{(wnew[: p.T] - w[: p.T]).min()}"
+        )
+        logger.info(
+            f"r diff: {(rnew[: p.T] - r[: p.T]).max()}, "
+            + f"{(rnew[: p.T] - r[: p.T]).min()}"
+        )
+        logger.info(
+            f"r_p diff: {(r_p_new[: p.T] - r_p[: p.T]).max()}, "
+            + f"{(r_p_new[: p.T] - r_p[: p.T]).min()}"
+        )
+        logger.info(
+            f"p_m diff: {(new_p_m[: p.T, :] - p_m[: p.T, :]).max()}, "
+            + f"{(new_p_m[: p.T, :] - p_m[: p.T, :]).min()}"
+        )
+        logger.info(
+            f"BQ diff: {(BQnew[: p.T] - BQ[: p.T]).max()}, "
+            + f"{(BQnew[: p.T] - BQ[: p.T]).min()}"
+        )
+        logger.info(
+            f"TR diff: {(TR_new[: p.T] - TR[: p.T]).max()}, "
+            + f"{(TR_new[: p.T] - TR[: p.T]).min()}"
+        )
 
         TPIdist = np.array(
-            list(utils.pct_diff_func(rnew[:p.T], r[:p.T])) +
-            list(utils.pct_diff_func(wnew[:p.T], w[:p.T])) +
-            list(utils.pct_diff_func(Ynew[:p.T], Y[:p.T])) +
-            list(utils.pct_diff_func(BQnew[:p.T], BQ[:p.T]).flatten()) +
-            list(utils.pct_diff_func(TR_new[:p.T], TR[:p.T]))).max()
+            list(utils.pct_diff_func(r_p_new[: p.T], r_p[: p.T]))
+            + list(utils.pct_diff_func(rnew[: p.T], r[: p.T]))
+            + list(utils.pct_diff_func(wnew[: p.T], w[: p.T]))
+            + list(
+                utils.pct_diff_func(new_p_m[: p.T, :], p_m[: p.T, :]).flatten()
+            )
+            + list(utils.pct_diff_func(BQnew[: p.T], BQ[: p.T]).flatten())
+            + list(utils.pct_diff_func(TR_new[: p.T], TR[: p.T]))
+        ).max()
+        if outer_updater is not None:
+            # accelerated methods: use the true residual accel_dist, computed
+            # above from the pre-update guess, because the post-update
+            # distance can be spuriously ~0 for accelerated steps.
+            TPIdist = accel_dist
 
         TPIdist_vec[TPIiter] = TPIdist
-        # After T=10, if cycling occurs, drop the value of nu
-        # wait til after T=10 or so, because sometimes there is a jump up
-        # in the first couple iterations
-        # if TPIiter > 10:
-        #     if TPIdist_vec[TPIiter] - TPIdist_vec[TPIiter - 1] > 0:
-        #         nu /= 2
-        #         print 'New Value of nu:', nu
+        # Accelerated safety net: if a step raised the distance sharply or went
+        # non-finite, reset the accelerator so the next step is a fresh damped
+        # restart (prevents runaway on the stiff case). Never fires for picard.
+        if outer_updater is not None and TPIiter > 0:
+            if (
+                not np.isfinite(TPIdist)
+                or TPIdist > 10.0 * TPIdist_vec[TPIiter - 1]
+            ):
+                outer_updater.reset()
+                logger.info("accelerated step diverged; reset accelerator")
         TPIiter += 1
-        print('Iteration:', TPIiter)
-        print('\tDistance:', TPIdist)
+        logger.info(f"Iteration: {TPIiter}")
+        logger.info(f"Distance: {TPIdist}")
+        # Stall detection: when the best distance has stopped improving
+        # over a window of iterations, further iterations repeat the same
+        # pattern and cannot reach the tolerance -- diagnose the cause and,
+        # if TPI_stall_action="stop", end the loop early (the solution
+        # checks after the loop then fail the run as any non-convergence).
+        # In the default warn mode the diagnosis is logged once per stall,
+        # and again only if it changes (e.g. escalates to diverging).
+        stall = solvers.diagnose_stall(
+            TPIdist_vec, TPIiter, p.TPI_stall_window
+        )
+        if stall != stall_reported:
+            stall_reported = stall
+            if stall == "diverging":
+                logger.error(
+                    "TPI stalled and diverging: the best distance over "
+                    f"the last {p.TPI_stall_window} iterations is far "
+                    "above the earlier best. This usually signals an "
+                    "inconsistent fiscal block (spending, revenue, and "
+                    "debt_ratio_ss), not a solver problem."
+                )
+            elif stall == "oscillating":
+                logger.error(
+                    "TPI stalled: the best distance has not improved "
+                    f"over the last {p.TPI_stall_window} iterations "
+                    f"(current {TPIdist:.2e}, tolerance "
+                    f"{p.mindist_TPI}). The outer loop is cycling; try "
+                    "a lower nu, or TPI_outer_method='anderson' if not "
+                    "already enabled."
+                )
+        if stall is not None and p.TPI_stall_action == "stop":
+            break
 
     # Compute effective and marginal tax rates for all agents
-    mtrx_params_4D = np.tile(
-        p.mtrx_params[:p.T, :, :].reshape(p.T, p.S, 1, p.mtrx_params.shape[2]),
-        (1, 1, p.J, 1))
-    mtry_params_4D = np.tile(
-        p.mtry_params[:p.T, :, :].reshape(p.T, p.S, 1, p.mtry_params.shape[2]),
-        (1, 1, p.J, 1))
-
-    e_3D = np.tile(p.e.reshape(1, p.S, p.J), (p.T, 1, 1))
-    mtry_path = tax.MTR_income(r_p_path[:p.T], wpath[:p.T],
-                               bmat_s[:p.T, :, :],
-                               n_mat[:p.T, :, :], factor, True,
-                               e_3D, etr_params_4D, mtry_params_4D, p)
-    mtrx_path = tax.MTR_income(r_p_path[:p.T], wpath[:p.T],
-                               bmat_s[:p.T, :, :],
-                               n_mat[:p.T, :, :], factor, False,
-                               e_3D, etr_params_4D, mtrx_params_4D, p)
-    etr_path = tax.ETR_income(r_p_path[:p.T], wpath[:p.T],
-                              bmat_s[:p.T, :, :],
-                              n_mat[:p.T, :, :], factor, e_3D,
-                              etr_params_4D, p)
-
-    C = aggr.get_C(c_mat, p, 'TPI')
+    num_params = len(p.mtrx_params[0][0])
+    etr_params_4D = [
+        [
+            [
+                [p.etr_params[t][s][i] for i in range(num_params)]
+                for j in range(p.J)
+            ]
+            for s in range(p.S)
+        ]
+        for t in range(p.T)
+    ]
+    mtrx_params_4D = [
+        [
+            [
+                [p.mtrx_params[t][s][i] for i in range(num_params)]
+                for j in range(p.J)
+            ]
+            for s in range(p.S)
+        ]
+        for t in range(p.T)
+    ]
+    mtry_params_4D = [
+        [
+            [
+                [p.mtry_params[t][s][i] for i in range(num_params)]
+                for j in range(p.J)
+            ]
+            for s in range(p.S)
+        ]
+        for t in range(p.T)
+    ]
+    labor_noncompliance_rate_3D = np.tile(
+        np.reshape(
+            p.labor_income_tax_noncompliance_rate[: p.T, :], (p.T, 1, p.J)
+        ),
+        (1, p.S, 1),
+    )
+    capital_noncompliance_rate_3D = np.tile(
+        np.reshape(
+            p.capital_income_tax_noncompliance_rate[: p.T, :], (p.T, 1, p.J)
+        ),
+        (1, p.S, 1),
+    )
+    income_tax_filer_3D = np.tile(
+        np.reshape(p.income_tax_filer[: p.T, :], (p.T, 1, p.J)),
+        (1, p.S, 1),
+    )
+    e_3D = p.e
+    mtry_path = tax.MTR_income(
+        r_p_path[: p.T],
+        wpath[: p.T],
+        bmat_s[: p.T, :, :],
+        n_mat[: p.T, :, :],
+        factor,
+        True,
+        e_3D,
+        etr_params_4D,
+        mtry_params_4D,
+        capital_noncompliance_rate_3D,
+        income_tax_filer_3D,
+        p,
+    )
+    mtrx_path = tax.MTR_income(
+        r_p_path[: p.T],
+        wpath[: p.T],
+        bmat_s[: p.T, :, :],
+        n_mat[: p.T, :, :],
+        factor,
+        False,
+        e_3D,
+        etr_params_4D,
+        mtrx_params_4D,
+        labor_noncompliance_rate_3D,
+        income_tax_filer_3D,
+        p,
+    )
+    etr_path = tax.ETR_income(
+        r_p_path[: p.T],
+        wpath[: p.T],
+        bmat_s[: p.T, :, :],
+        n_mat[: p.T, :, :],
+        factor,
+        e_3D,
+        etr_params_4D,
+        labor_noncompliance_rate_3D,
+        capital_noncompliance_rate_3D,
+        income_tax_filer_3D,
+        p,
+    )
     # Note that implicitly in this computation is that immigrants'
     # wealth is all in the form of private capital
-    I_d = aggr.get_I(bmat_splus1[:p.T], K_d[1:p.T + 1], K_d[:p.T], p,
-                     'TPI')
-    I = aggr.get_I(bmat_splus1[:p.T], K[1:p.T + 1], K[:p.T], p, 'TPI')
+    I_d = aggr.get_I(
+        bmat_splus1[: p.T], K_d[1 : p.T + 1], K_d[: p.T], p, "TPI"
+    )
+    I = aggr.get_I(bmat_splus1[: p.T], K[1 : p.T + 1], K[: p.T], p, "TPI")  # noqa: E741
     # solve resource constraint
     # foreign debt service costs
     debt_service_f = fiscal.get_debt_service_f(r_p, D_f)
+    net_capital_outflows = aggr.get_capital_outflows(
+        r_p[: p.T],
+        K_f[: p.T],
+        new_borrowing_f[: p.T],
+        debt_service_f[: p.T],
+        p,
+    )
+    # Fill in arrays, noting that M-1 industries only produce consumption goods
+    G_vec = np.zeros((p.T, p.M))
+    G_vec[:, -1] = G[: p.T]
+    # Map consumption goods back to demands for production goods
+    C_m_vec = (
+        np.tile(p.io_matrix.reshape(1, p.I, p.M), (p.T, 1, 1))
+        * np.tile(C_vec[: p.T, :].reshape(p.T, p.I, 1), (1, 1, p.M))
+    ).sum(axis=1)
+    I_d_vec = np.zeros((p.T, p.M))
+    I_d_vec[:, -1] = I_d[: p.T]
+    I_g_vec = np.zeros((p.T, p.M))
+    I_g_vec[:, -1] = I_g[: p.T]
+    net_capital_outflows_vec = np.zeros((p.T, p.M))
+    net_capital_outflows_vec[:, -1] = net_capital_outflows[: p.T]
+    RM_vec = np.zeros((p.T, p.M))
+    RM_vec[:, -1] = RM[: p.T]
+    foreign_aid_vec = np.zeros((p.T, p.M))
+    foreign_aid_vec[:, -1] = foreign_aid[: p.T]
     RC_error = aggr.resource_constraint(
-        Y[:p.T - 1], C[:p.T - 1], G[:p.T - 1], I_d[:p.T - 1], I_g[:p.T - 1],
-        K_f[:p.T - 1], new_borrowing_f[:p.T - 1],
-        debt_service_f[:p.T - 1], r_p[:p.T - 1], p)
+        Y_vec,
+        C_m_vec,
+        G_vec,
+        I_d_vec,
+        I_g_vec,
+        net_capital_outflows_vec,
+        RM_vec,
+        foreign_aid_vec,
+    )
     # Compute total investment (not just domestic)
-    I_total = aggr.get_I(None, K[1:p.T + 1], K[:p.T], p, 'total_tpi')
+    I_total = aggr.get_I(None, K[1 : p.T + 1], K[: p.T], p, "total_tpi")
 
     # Compute resource constraint error
     rce_max = np.amax(np.abs(RC_error))
-    print('Max absolute value resource constraint error:', rce_max)
+    logger.info(f"Max absolute value resource constraint error: {rce_max}")
 
-    print('Checking time path for violations of constraints.')
+    logger.info("Checking time path for violations of constraints.")
     for t in range(p.T):
         household.constraint_checker_TPI(
-            b_mat[t], n_mat[t], c_mat[t], t, p.ltilde)
+            b_mat[t], n_mat[t], c_mat[t], t, p.ltilde
+        )
 
-    eul_savings = euler_errors[:, :p.S, :]
-    eul_laborleisure = euler_errors[:,  p.S:, :]
+    eul_savings = euler_errors[:, : p.S, :]
+    eul_laborleisure = euler_errors[:, p.S :, :]
 
-    print('Max Euler error, savings: ', np.abs(eul_savings).max())
-    print('Max Euler error labor supply: ', np.abs(eul_laborleisure).max())
+    logger.info(f"Max Euler error, savings: {np.abs(eul_savings).max()}")
+    logger.info(
+        f"Max Euler error labor supply: {np.abs(eul_laborleisure).max()}"
+    )
 
-    '''
+    # Aggregate hours worked (not weighted by effective-labor units).
+    N = aggr.get_N(n_mat[: p.T], p, "TPI")
+
+    """
     ------------------------------------------------------------------------
     Save variables/values so they can be used in other modules
     ------------------------------------------------------------------------
-    '''
+    """
 
-    output = {'Y': Y[:p.T], 'B': B, 'K': K, 'K_f': K_f, 'K_d': K_d,
-              'L': L, 'C': C, 'I': I, 'K_g': K_g, 'I_g': I_g,
-              'I_total': I_total, 'I_d': I_d, 'BQ': BQ,
-              'total_tax_revenue': total_tax_revenue,
-              'business_tax_revenue': business_tax_revenue,
-              'iit_payroll_tax_revenue': iit_payroll_tax_revenue,
-              'iit_revenue': iit_revenue,
-              'payroll_tax_revenue': payroll_tax_revenue, 'TR': TR,
-              'agg_pension_outlays': agg_pension_outlays,
-              'bequest_tax_revenue': bequest_tax_revenue,
-              'wealth_tax_revenue': wealth_tax_revenue,
-              'cons_tax_revenue': cons_tax_revenue, 'G': G, 'D': D,
-              'D_f': D_f, 'D_d': D_d, 'r': r, 'r_gov': r_gov,
-              'r_p': r_p, 'w': w, 'bmat_splus1': bmat_splus1,
-              'bmat_s': bmat_s[:p.T, :, :], 'n_mat': n_mat[:p.T, :, :],
-              'c_path': c_mat, 'bq_path': bqmat, 'tr_path': trmat,
-              'y_before_tax_mat': y_before_tax_mat,
-              'tax_path': tax_mat, 'eul_savings': eul_savings,
-              'eul_laborleisure': eul_laborleisure,
-              'resource_constraint_error': RC_error,
-              'new_borrowing_f': new_borrowing_f,
-              'debt_service_f': debt_service_f,
-              'etr_path': etr_path, 'mtrx_path': mtrx_path,
-              'mtry_path': mtry_path, 'ubi_path': ubi, 'UBI_path': UBI}
+    output = {
+        "Y": Y[: p.T, ...],
+        "B": B[: p.T, ...],
+        "K": K[: p.T, ...],
+        "K_f": K_f[: p.T],
+        "K_d": K_d[: p.T, ...],
+        "L": L[: p.T, ...],
+        "N": N[: p.T, ...],
+        "C": C[: p.T, ...],
+        "I": I[: p.T, ...],
+        "I_total": I_total[: p.T, ...],
+        "I_d": I_d[: p.T, ...],
+        "K_g": K_g[: p.T, ...],
+        "I_g": I_g[: p.T, ...],
+        "foreign_aid": foreign_aid[: p.T, ...],
+        "BQ": BQ[: p.T, ...],
+        "RM": RM[: p.T, ...],
+        "Y_m": Y_vec[: p.T, ...],
+        "K_m": K_vec[: p.T, ...],
+        "L_m": L_vec[: p.T, ...],
+        "C_i": C_vec[: p.T, ...],
+        "TR": TR[: p.T, ...],
+        "agg_pension_outlays": agg_pension_outlays[: p.T, ...],
+        "G": G[: p.T, ...],
+        "UBI": UBI[: p.T, ...],
+        "total_government_outlays": (
+            TR[: p.T, ...]
+            + UBI[: p.T, ...]
+            + G[: p.T, ...]
+            + I_g[: p.T, ...]
+            + debt_service[: p.T, ...]
+            + agg_pension_outlays[: p.T, ...]
+        ),
+        "total_primary_government_outlays": (
+            agg_pension_outlays[: p.T, ...]
+            + TR[: p.T, ...]
+            + UBI[: p.T, ...]
+            + G[: p.T, ...]
+            + I_g[: p.T, ...]
+        ),
+        "total_tax_revenue": total_tax_revenue[: p.T, ...],
+        "business_tax_revenue": business_tax_revenue[: p.T, ...],
+        "iit_payroll_tax_revenue": iit_payroll_tax_revenue[: p.T, ...],
+        "iit_revenue": iit_revenue[: p.T, ...],
+        "payroll_tax_revenue": payroll_tax_revenue[: p.T, ...],
+        "bequest_tax_revenue": bequest_tax_revenue[: p.T, ...],
+        "wealth_tax_revenue": wealth_tax_revenue[: p.T, ...],
+        "cons_tax_revenue": cons_tax_revenue[: p.T, ...],
+        "D": D[: p.T, ...],
+        "D_f": D_f[: p.T, ...],
+        "D_d": D_d[: p.T, ...],
+        "new_borrowing": new_borrowing[: p.T, ...],
+        "debt_service": debt_service[: p.T, ...],
+        "new_borrowing_f": new_borrowing_f[: p.T, ...],
+        "debt_service_f": debt_service_f[: p.T, ...],
+        "r": r[: p.T, ...],
+        "r_gov": r_gov[: p.T, ...],
+        "r_p": r_p[: p.T, ...],
+        "w": w[: p.T, ...],
+        "p_m": p_m[: p.T, ...],
+        "p_i": p_i[: p.T, ...],
+        "p_tilde": p_tilde[: p.T, ...],
+        "b_sp1": bmat_splus1[: p.T, ...],
+        "b_s": bmat_s[: p.T, ...],
+        "b_sp1_preTP": b_splus1init,
+        "n": n_mat[: p.T, ...],
+        "c": c_mat[: p.T, ...],
+        "c_i": c_i[: p.T, ...],
+        "bq": bqmat[: p.T, ...],
+        "rm": rmmat[: p.T, ...],
+        "tr": trmat[: p.T, ...],
+        "ubi": ubi[: p.T, ...],
+        "before_tax_income": y_before_tax_mat[: p.T, ...],
+        "labor_income": labor_income_mat[: p.T, ...],
+        "capital_income": capital_income_mat[: p.T, ...],
+        "hh_net_taxes": tax_mat[: p.T, ...],
+        "income_payroll_taxes": income_tax_mat[: p.T, ...],
+        "sales_tax": sales_tax_mat[: p.T, ...],
+        "wealth_tax": wealth_tax_mat[: p.T, ...],
+        "bequest_tax": bq_tax_mat[: p.T, ...],
+        "pension_benefits": pension_mat[: p.T, ...],
+        "etr": etr_path[: p.T, ...],
+        "mtrx": mtrx_path[: p.T, ...],
+        "mtry": mtry_path[: p.T, ...],
+        "theta": theta,
+        "factor": factor,
+        "euler_savings": eul_savings[: p.T, ...],
+        "euler_labor_leisure": eul_laborleisure[: p.T, ...],
+        "resource_constraint_error": RC_error[: p.T, ...],
+    }
 
     tpi_dir = os.path.join(p.output_base, "TPI")
     utils.mkdirs(tpi_dir)
@@ -748,24 +2095,34 @@ def run_TPI(p, client=None):
         pickle.dump(output, f)
 
     if np.any(G) < 0:
-        print('Government spending is negative along transition path' +
-              ' to satisfy budget')
+        logger.warning(
+            "Government spending is negative along transition path"
+            + " to satisfy budget"
+        )
 
-    if (((TPIiter >= p.maxiter) or
-            (np.absolute(TPIdist) > p.mindist_TPI)) and
-            ENFORCE_SOLUTION_CHECKS):
-        raise RuntimeError('Transition path equlibrium not found' +
-                           ' (TPIdist)')
+    if (
+        (TPIiter >= p.maxiter) or (np.absolute(TPIdist) > p.mindist_TPI)
+    ) and ENFORCE_SOLUTION_CHECKS:
+        msg = "Transition path equlibrium not found (TPIdist)"
+        if stall == "oscillating":
+            msg += (
+                "; the outer loop stalled cycling -- try a lower nu, or "
+                "TPI_outer_method='anderson'"
+            )
+        elif stall == "diverging":
+            msg += (
+                "; the outer loop stalled diverging -- check the fiscal "
+                "block (spending, revenue, debt_ratio_ss)"
+            )
+        raise RuntimeError(msg)
 
-    if ((np.any(np.absolute(RC_error) >= p.mindist_TPI * 10)) and
-            ENFORCE_SOLUTION_CHECKS):
-        raise RuntimeError('Transition path equlibrium not found ' +
-                           '(RC_error)')
+    if (np.any(np.absolute(RC_error) >= p.RC_TPI)) and ENFORCE_SOLUTION_CHECKS:
+        raise RuntimeError(_rc_error_message(RC_error, p.RC_TPI))
 
-    if ((np.any(np.absolute(eul_savings) >= p.mindist_TPI) or
-            (np.any(np.absolute(eul_laborleisure) > p.mindist_TPI))) and
-            ENFORCE_SOLUTION_CHECKS):
-        raise RuntimeError('Transition path equlibrium not found ' +
-                           '(eulers)')
+    if (
+        np.any(np.absolute(eul_savings) >= p.mindist_TPI)
+        or (np.any(np.absolute(eul_laborleisure) > p.mindist_TPI))
+    ) and ENFORCE_SOLUTION_CHECKS:
+        raise RuntimeError(_euler_error_message(eul_savings, eul_laborleisure))
 
     return output

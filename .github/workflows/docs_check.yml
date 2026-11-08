@@ -1,28 +1,45 @@
 name: Check that docs build
-on: [push, pull_request]
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'Makefile'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'docs/**'
+      - '.github/workflows/docs_check.yml'
+      - '.github/workflows/deploy_docs.yml'
+      - '**.md'
+      - 'ogcore/**.py'
 
 jobs:
   build:
+    if: github.repository == 'PSLmodels/OG-Core'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2 # If you're using actions/checkout@v2 you must set persist-credentials to false in most cases for the deployment to work correctly.
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - name: Setup Miniconda
-        uses: conda-incubator/setup-miniconda@v2
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
-          activate-environment: ogcore-dev
-          environment-file: environment.yml
-          python-version: 3.7
-          auto-activate-base: false
+          python-version: "3.15"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install package and dependencies
+        run: uv sync --extra dev --extra docs
+
+      - name: Check documentation build tooling
+        run: uv run --extra dev --extra docs pytest docs/test_build_docs.py
 
       - name: Build # Build Jupyter Book
-        shell: bash -l {0}
+        env:
+          BASE_URL: /OG-Core
         run: |
-          pip install -e .
-          pip install jupyter-book>=0.11.3
-          pip install sphinxcontrib-bibtex>=2.0.0
-          cd docs
-          jb build ./book
+          uv run make documentation
